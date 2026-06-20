@@ -1,0 +1,17 @@
+{
+  "arrival": {
+    "type": "fixed_interval",
+    "interval": 720
+  },
+  "lots_per_order": 20,
+  "waiting_list": {
+    "max_size": 0
+  },
+  "product_mix": {
+    "P01": 1,
+    "P02": 1,
+    "P03": 1,
+    "P04": 1,
+    "P05": 1
+  }
+}

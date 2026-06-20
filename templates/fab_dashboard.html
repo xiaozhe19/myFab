@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Fab 调度看板</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='fab_dashboard.css') }}">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">myFab scheduling dashboard</p>
+        <h1>Fab 调度策略看板</h1>
+      </div>
+      <div class="topbar-right">
+        <label class="result-picker" for="result-select">
+          <span>Result</span>
+          <select id="result-select" aria-label="选择要显示的 result"></select>
+        </label>
+        <div class="run-meta">
+          <span id="strategy">strategy</span>
+          <strong id="run-id">run</strong>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="measurement-strip" aria-label="测量窗口">
+        <div><span>Warm-up</span><strong id="warmup-time">0</strong></div>
+        <div><span>Measurement Window</span><strong id="measurement-window">0 → 0</strong></div>
+        <div><span>Duration</span><strong id="measurement-duration">0</strong></div>
+      </section>
+
+      <section class="system-strip" aria-label="仿真结构">
+        <article>
+          <span>Factory</span>
+          <strong id="factory-id">-</strong>
+          <small id="factory-detail">0 machines · 0 stations · 0 products</small>
+        </article>
+        <article>
+          <span>Order Source</span>
+          <strong id="order-cadence">Every 0</strong>
+          <small id="order-detail">0 lots/order · 0 orders generated</small>
+        </article>
+        <article>
+          <span>Release Policy</span>
+          <strong id="release-cadence">Every 0</strong>
+          <small>Configured by strategy code</small>
+        </article>
+        <article>
+          <span>External Backlog</span>
+          <strong id="external-backlog">0</strong>
+          <small id="backlog-detail">0 generated · capacity ∞</small>
+        </article>
+      </section>
+
+      <section class="metric-grid" aria-label="算法对比指标">
+        <article class="metric-card">
+          <span>MCT Average</span>
+          <strong id="cycle-avg">0</strong>
+          <small id="cycle-detail">P50 0 · P90 0 · Max 0</small>
+        </article>
+        <article class="metric-card">
+          <span>Movement</span>
+          <strong id="movement-count">0</strong>
+          <small id="movement-detail">Rate 0 / time</small>
+        </article>
+        <article class="metric-card">
+          <span>Throughput</span>
+          <strong id="throughput-count">0</strong>
+          <small id="throughput-detail">Rate 0 / time</small>
+        </article>
+        <article class="metric-card">
+          <span>Average Fab WIP</span>
+          <strong id="average-wip">0</strong>
+          <small>Waiting list excluded</small>
+        </article>
+        <article class="metric-card">
+          <span>Released</span>
+          <strong id="released-count">0</strong>
+          <small id="released-detail">Rate 0 · Pool 0</small>
+        </article>
+      </section>
+
+      <section class="panel product-panel" aria-label="产品表现">
+        <div class="panel-heading">
+          <h2>Product Mix & Performance</h2>
+          <span>订单产品权重、正式窗口投入、完工和 MCT</span>
+        </div>
+        <div id="product-performance" class="product-performance"></div>
+      </section>
+
+      <section class="panel animation-panel" aria-label="调度动画">
+        <div class="panel-heading">
+          <div class="panel-title">
+            <h2>Schedule Animation</h2>
+            <span id="animation-clock">time 0</span>
+          </div>
+          <div class="animation-tools" aria-label="animation controls">
+            <button id="animation-toggle" type="button" title="Play or pause">▶</button>
+            <button id="animation-back" type="button" title="Step backward">‹</button>
+            <button id="animation-forward" type="button" title="Step forward">›</button>
+            <label class="animation-slider" title="Animation time">
+              <span>Time</span>
+              <input id="animation-range" type="range" min="0" max="1" step="1" value="0">
+            </label>
+            <label class="animation-speed" title="Playback speed">
+              <span>Speed</span>
+              <select id="animation-speed">
+                <option value="0.5">0.5x</option>
+                <option value="1" selected>1x</option>
+                <option value="2">2x</option>
+                <option value="4">4x</option>
+              </select>
+            </label>
+          </div>
+        </div>
+        <div class="animation-grid">
+          <div id="animation-machines" class="animation-machines"></div>
+          <div class="buffer-panel waiting-panel">
+            <div class="buffer-header">
+              <div>
+                <span>Order Queue</span>
+                <strong id="waiting-size">0 / 0</strong>
+              </div>
+              <div>
+                <span>Head Order</span>
+                <strong id="waiting-head">-</strong>
+              </div>
+              <div>
+                <span>Generated Lots</span>
+                <strong id="generated-count">0</strong>
+              </div>
+            </div>
+            <div id="waiting-list" class="waiting-list"></div>
+            <small class="waiting-note">按订单分组显示尚未投入 fab 的 lot；队首订单优先释放。</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel order-panel" aria-label="订单到达历史">
+        <div class="panel-heading">
+          <h2>Order Arrival History</h2>
+          <span>每张订单的到达时间、lot 数与产品组成</span>
+        </div>
+        <div id="order-history" class="order-history"></div>
+      </section>
+
+      <section class="dashboard-grid">
+        <div class="panel wide">
+          <div class="panel-heading">
+            <div class="panel-title">
+              <h2>Machine Timeline</h2>
+              <span id="horizon">horizon 0</span>
+            </div>
+            <div class="timeline-tools" aria-label="timeline zoom controls">
+              <button id="timeline-fullscreen" type="button" title="Fullscreen timeline">⛶</button>
+              <button id="timeline-zoom-out" type="button" title="Zoom out">-</button>
+              <button id="timeline-zoom-reset" type="button" title="Reset zoom">1x</button>
+              <button id="timeline-zoom-fit" type="button" title="Fit to screen">Fit</button>
+              <button id="timeline-zoom-in" type="button" title="Zoom in">+</button>
+              <label class="timeline-slider" title="Timeline zoom">
+                <span>Zoom</span>
+                <input id="timeline-zoom-range" type="range" min="0.6" max="4" step="0.1" value="1">
+              </label>
+              <span id="timeline-zoom-value" class="timeline-zoom-value">1.0x</span>
+            </div>
+          </div>
+          <div id="timeline" class="timeline"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <h2>Machine Utilization</h2>
+          </div>
+          <div id="utilization-bars" class="bar-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <h2>Queue Length</h2>
+          </div>
+          <div id="queue-bars" class="bar-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <h2>Bottleneck Identification</h2>
+          </div>
+          <div id="bottlenecks" class="rank-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <h2>API Ingestion</h2>
+            <button id="load-sample" type="button">载入示例</button>
+          </div>
+          <textarea id="payload" spellcheck="false" aria-label="run payload JSON"></textarea>
+          <button id="submit-run" class="primary" type="button">提交运行结果</button>
+          <p id="submit-status" class="status"></p>
+        </div>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='fab_dashboard.js') }}"></script>
+  </body>
+</html>

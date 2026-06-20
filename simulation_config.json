@@ -1,0 +1,7 @@
+{
+  "simulation_id": "small-fab-run",
+  "time_unit": "minute",
+  "start_time": 0,
+  "warmup_time": 3600,
+  "measurement_duration": 14400
+}
