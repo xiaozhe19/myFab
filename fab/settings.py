@@ -11,6 +11,38 @@ def load_json(path: Path) -> dict[str, Any]:
         return json.load(file)
 
 
+def merge_machine_config(
+    factory_config: dict[str, Any],
+    machine_config: dict[str, Any],
+) -> dict[str, Any]:
+    config = deepcopy(factory_config)
+    config["machines"] = deepcopy(machine_config.get("machines", []))
+    config["machine_downtime"] = deepcopy(
+        machine_config.get("machine_downtime", {})
+    )
+    return config
+
+
+def merge_product_config(
+    factory_config: dict[str, Any],
+    product_config: dict[str, Any],
+) -> dict[str, Any]:
+    config = deepcopy(factory_config)
+    config["products"] = deepcopy(product_config.get("products", []))
+    return config
+
+
+def build_factory_config(
+    factory_config: dict[str, Any],
+    product_config: dict[str, Any],
+    machine_config: dict[str, Any],
+) -> dict[str, Any]:
+    return merge_machine_config(
+        merge_product_config(factory_config, product_config),
+        machine_config,
+    )
+
+
 def load_seed_sets(path: Path) -> list[dict[str, int]]:
     payload = load_json(path)
     seed_sets = payload.get("seed_sets") if isinstance(payload, dict) else payload

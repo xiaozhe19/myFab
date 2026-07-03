@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from fab_sim_core import (
+from fab.core import (
     FabStrategyBase,
     FactoryState,
     MachineState,
@@ -31,7 +31,7 @@ class BatchingFIFOStrategy(FabStrategyBase):
             wafer
             for wafer in ready_candidates(
                 state.wafers,
-                machine.type,
+                machine,
                 state.current_time,
             )
             if wafer.id not in reserved_wafer_ids

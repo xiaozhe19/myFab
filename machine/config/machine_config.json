@@ -1,0 +1,152 @@
+{
+  "machines": [
+    {
+      "id": "M01",
+      "name": "Litho-01",
+      "type": "Litho",
+      "available_from": 0,
+      "generation": "legacy"
+    },
+    {
+      "id": "M06",
+      "name": "Litho-02",
+      "type": "Litho",
+      "available_from": 0,
+      "generation": "immersion"
+    },
+    {
+      "id": "M07",
+      "name": "Litho-03",
+      "type": "Litho",
+      "available_from": 60,
+      "generation": "legacy"
+    },
+    {
+      "id": "M02",
+      "name": "Etch-01",
+      "type": "Etch",
+      "available_from": 0,
+      "chamber_count": 1
+    },
+    {
+      "id": "M08",
+      "name": "Etch-02",
+      "type": "Etch",
+      "available_from": 30,
+      "chamber_count": 2
+    },
+    {
+      "id": "M03",
+      "name": "Deposition-01",
+      "type": "Deposition",
+      "available_from": 0,
+      "chamber_count": 1
+    },
+    {
+      "id": "M09",
+      "name": "Deposition-02",
+      "type": "Deposition",
+      "available_from": 45,
+      "chamber_count": 1
+    },
+    {
+      "id": "M04",
+      "name": "Clean-01",
+      "type": "Clean",
+      "available_from": 0,
+      "wet_bench": "WB-A"
+    },
+    {
+      "id": "M10",
+      "name": "Clean-02",
+      "type": "Clean",
+      "available_from": 0,
+      "wet_bench": "WB-B"
+    },
+    {
+      "id": "M05",
+      "name": "Metrology-01",
+      "type": "Metrology",
+      "available_from": 0,
+      "mode": "CD"
+    },
+    {
+      "id": "M11",
+      "name": "Metrology-02",
+      "type": "Metrology",
+      "available_from": 20,
+      "mode": "overlay"
+    }
+  ],
+  "machine_downtime": {
+    "enabled": true,
+    "models": {
+      "M01": {
+        "mtbf_min": 420,
+        "mtbf_max": 620,
+        "mttr_min": 25,
+        "mttr_max": 55
+      },
+      "M06": {
+        "mtbf_min": 520,
+        "mtbf_max": 760,
+        "mttr_min": 35,
+        "mttr_max": 80
+      },
+      "M07": {
+        "mtbf_min": 360,
+        "mtbf_max": 520,
+        "mttr_min": 20,
+        "mttr_max": 50
+      },
+      "M02": {
+        "mtbf_min": 360,
+        "mtbf_max": 540,
+        "mttr_min": 20,
+        "mttr_max": 45
+      },
+      "M08": {
+        "mtbf_min": 450,
+        "mtbf_max": 650,
+        "mttr_min": 18,
+        "mttr_max": 42
+      },
+      "M03": {
+        "mtbf_min": 480,
+        "mtbf_max": 700,
+        "mttr_min": 30,
+        "mttr_max": 70
+      },
+      "M09": {
+        "mtbf_min": 430,
+        "mtbf_max": 640,
+        "mttr_min": 28,
+        "mttr_max": 65
+      },
+      "M04": {
+        "mtbf_min": 520,
+        "mtbf_max": 760,
+        "mttr_min": 15,
+        "mttr_max": 35
+      },
+      "M10": {
+        "mtbf_min": 470,
+        "mtbf_max": 720,
+        "mttr_min": 16,
+        "mttr_max": 38
+      },
+      "M05": {
+        "mtbf_min": 600,
+        "mtbf_max": 900,
+        "mttr_min": 10,
+        "mttr_max": 30
+      },
+      "M11": {
+        "mtbf_min": 560,
+        "mtbf_max": 840,
+        "mttr_min": 12,
+        "mttr_max": 34
+      }
+    }
+  }
+}

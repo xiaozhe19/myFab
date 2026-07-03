@@ -1,0 +1,39 @@
+{
+  "factory_id": "small-reentrant-fab",
+  "setup": {
+    "enabled": true,
+    "same_product_time": {
+      "min": 0,
+      "max": 0
+    },
+    "default_product_change_time": {
+      "min": 6,
+      "max": 14
+    },
+    "machine_type_multiplier": {
+      "Litho": 1.6,
+      "Etch": 1.2,
+      "Deposition": 1.4,
+      "Clean": 0.7,
+      "Metrology": 0.5
+    },
+    "product_change_overrides": {
+      "P01->P04": {
+        "min": 14,
+        "max": 28
+      },
+      "P04->P01": {
+        "min": 16,
+        "max": 30
+      },
+      "P02->P05": {
+        "min": 10,
+        "max": 22
+      },
+      "P05->P02": {
+        "min": 12,
+        "max": 24
+      }
+    }
+  }
+}

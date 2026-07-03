@@ -76,7 +76,7 @@ class DynamicDBR:
             "machine_downtime", {}
         ).get("models", {})
 
-        # 同一 process 可能对应多台并行设备。
+        # 同一 process 对应多台并行设备。
         self.machine_groups = {}
         self.machine_parameters = {}
         for machine in self.machine_configs:
@@ -100,7 +100,7 @@ class DynamicDBR:
 
 
     # 产能与瓶颈识别
-    def cal_machine_availability(self, machine):
+    def cal_machine_availability(self, machine): #单个机器的Cm
         """计算单台设备长期平均可用率。"""
         model = machine.downtime_model
         if model:
@@ -109,7 +109,7 @@ class DynamicDBR:
             return mtbf / (mtbf + mttr)
         return 1.0
 
-    def cal_capacity_rate(self, machines):
+    def cal_capacity_rate(self, machines): #一个工序的Cm
         """计算工作站组有效产能率，单位 machine-minute/minute。"""
         if not isinstance(machines, (list, tuple)):
             machines = [machines]
@@ -118,7 +118,7 @@ class DynamicDBR:
             for machine in machines
         )
 
-    def cal_Cm(self, machine, window=720):
+    def cal_Cm(self, machine, window=720): # 主瓶颈的Cm
         """计算单台设备在指定窗口内的有效产能。"""
         return window * self.cal_machine_availability(machine)
 
@@ -277,8 +277,6 @@ class DynamicDBR:
         return bottleneck, candidates[bottleneck], BDm_list
 
     # Layer 与 Drum
-
-
     def build_layer_list(self, mbottleneck, wafer):
         """按第几次经过主瓶颈，将 lot 路线划分为 Layer。"""
         layer_list = []
@@ -371,7 +369,6 @@ class DynamicDBR:
         return total_bottleneck_pt / capacity_rate
     
     # Operation Buffer
-
     def get_operation_key(self, wafer, step=None):
         """用 (process, visit_number) 表示多产品环境中的操作 i。"""
         step = wafer.step if step is None else step
@@ -697,7 +694,7 @@ class DynamicDBR:
         2. 判断本次投料机会是否释放一个新 lot；
         3. 为每台空闲机器选择复合优先级最高的 lot。
         """
-        from fab_sim_core import (
+        from fab.core import (
             StrategyDecision,
             StrategyWakeup,
             ready_candidates,
@@ -780,7 +777,7 @@ class DynamicDBR:
                 wafer
                 for wafer in ready_candidates(
                     state.wafers,
-                    machine.type,
+                    machine,
                     state.current_time,
                 )
                 if wafer.id not in reserved_wafer_ids

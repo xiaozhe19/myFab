@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from fab_sim_core import (
+from fab.core import (
     FabStrategyBase,
     FactoryState,
     MachineState,
@@ -165,7 +165,7 @@ def select_dbr_job(
     reserved_wafer_ids = reserved_wafer_ids or set()
     candidates = [
         wafer
-        for wafer in ready_candidates(wafers, machine.type, current_time)
+        for wafer in ready_candidates(wafers, machine, current_time)
         if wafer.id not in reserved_wafer_ids
     ]
     if not candidates:

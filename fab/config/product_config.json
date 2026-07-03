@@ -1,0 +1,1899 @@
+{
+  "products": [
+    {
+      "id": "P01",
+      "name": "Logic-A",
+      "route": [
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 10.796
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 20.946
+            },
+            {
+              "id": "M06",
+              "process_time": 19.033
+            },
+            {
+              "id": "M07",
+              "process_time": 22.393
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 19.829
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 8.591
+            },
+            {
+              "id": "M10",
+              "process_time": 7.583
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 5.462
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 22.655
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 18.794
+            },
+            {
+              "id": "M06",
+              "process_time": 18.024
+            },
+            {
+              "id": "M07",
+              "process_time": 22.099
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 12.257
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 11.078
+            },
+            {
+              "id": "M10",
+              "process_time": 9.765
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 22.691
+            },
+            {
+              "id": "M09",
+              "process_time": 24.825
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 20.663
+            },
+            {
+              "id": "M07",
+              "process_time": 24.404
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 17.496
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 7.35
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.481
+            },
+            {
+              "id": "M10",
+              "process_time": 6.222
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 25.54
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 11.809
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 17.599
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 12.334
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 28.281
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 8.307
+            },
+            {
+              "id": "M11",
+              "process_time": 9.081
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 15.195
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 9.848
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 17.355
+            },
+            {
+              "id": "M09",
+              "process_time": 19.549
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 16.491
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 21.67
+            },
+            {
+              "id": "M08",
+              "process_time": 19.119
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 5.98
+            },
+            {
+              "id": "M11",
+              "process_time": 7.151
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 10.202
+            },
+            {
+              "id": "M10",
+              "process_time": 9.672
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 9.176
+            }
+          ]
+        }
+      ],
+      "reentry_steps": [
+        {
+          "process": "Clean",
+          "steps": [
+            0,
+            3,
+            8,
+            13,
+            17,
+            21,
+            26
+          ]
+        },
+        {
+          "process": "Deposition",
+          "steps": [
+            5,
+            9,
+            16,
+            22
+          ]
+        },
+        {
+          "process": "Etch",
+          "steps": [
+            2,
+            7,
+            11,
+            15,
+            20,
+            24
+          ]
+        },
+        {
+          "process": "Litho",
+          "steps": [
+            1,
+            6,
+            10,
+            14,
+            18,
+            23
+          ]
+        },
+        {
+          "process": "Metrology",
+          "steps": [
+            4,
+            12,
+            19,
+            25,
+            27
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P02",
+      "name": "Memory-B",
+      "route": [
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 24.178
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 11.33
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 23.87
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 18.267
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 8.355
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.929
+            },
+            {
+              "id": "M10",
+              "process_time": 6.617
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 20.334
+            },
+            {
+              "id": "M09",
+              "process_time": 22.193
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 24.787
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 14.935
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 11.66
+            },
+            {
+              "id": "M10",
+              "process_time": 11.634
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 5.171
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 17.923
+            },
+            {
+              "id": "M06",
+              "process_time": 15.351
+            },
+            {
+              "id": "M07",
+              "process_time": 19.817
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 19.924
+            },
+            {
+              "id": "M08",
+              "process_time": 16.705
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 24.404
+            },
+            {
+              "id": "M09",
+              "process_time": 27.098
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 8.949
+            },
+            {
+              "id": "M10",
+              "process_time": 8.739
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 20.157
+            },
+            {
+              "id": "M06",
+              "process_time": 18.199
+            },
+            {
+              "id": "M07",
+              "process_time": 21.744
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 9.845
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 18.379
+            },
+            {
+              "id": "M08",
+              "process_time": 16.607
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 7.657
+            },
+            {
+              "id": "M10",
+              "process_time": 7.069
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 24.686
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 27.59
+            },
+            {
+              "id": "M07",
+              "process_time": 30.808
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 14.699
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 7.617
+            },
+            {
+              "id": "M11",
+              "process_time": 9.666
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 10.377
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 26.407
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 21.88
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 21.087
+            },
+            {
+              "id": "M08",
+              "process_time": 19.739
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 8.932
+            },
+            {
+              "id": "M10",
+              "process_time": 8.509
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 10.833
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 11.864
+            },
+            {
+              "id": "M10",
+              "process_time": 10.452
+            }
+          ]
+        }
+      ],
+      "reentry_steps": [
+        {
+          "process": "Clean",
+          "steps": [
+            1,
+            5,
+            9,
+            14,
+            18,
+            23,
+            27,
+            29
+          ]
+        },
+        {
+          "process": "Deposition",
+          "steps": [
+            0,
+            6,
+            13,
+            19,
+            25
+          ]
+        },
+        {
+          "process": "Etch",
+          "steps": [
+            3,
+            8,
+            12,
+            17,
+            21,
+            26
+          ]
+        },
+        {
+          "process": "Litho",
+          "steps": [
+            2,
+            7,
+            11,
+            15,
+            20,
+            24
+          ]
+        },
+        {
+          "process": "Metrology",
+          "steps": [
+            4,
+            10,
+            16,
+            22,
+            28
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P03",
+      "name": "Analog-C",
+      "route": [
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.799
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 26.279
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 14.284
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 27.909
+            },
+            {
+              "id": "M09",
+              "process_time": 29.493
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 10.299
+            },
+            {
+              "id": "M11",
+              "process_time": 11.379
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 16.023
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.494
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 27.434
+            },
+            {
+              "id": "M06",
+              "process_time": 24.715
+            },
+            {
+              "id": "M07",
+              "process_time": 33.313
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 29.774
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 16.472
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 5.449
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 7.575
+            },
+            {
+              "id": "M10",
+              "process_time": 7.451
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 29.926
+            },
+            {
+              "id": "M07",
+              "process_time": 30.961
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 13.434
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 9.947
+            },
+            {
+              "id": "M10",
+              "process_time": 9.353
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 18.844
+            },
+            {
+              "id": "M09",
+              "process_time": 22.009
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 26.49
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 9.74
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 21.964
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 12.693
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 27.686
+            },
+            {
+              "id": "M09",
+              "process_time": 32.476
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 19.085
+            },
+            {
+              "id": "M08",
+              "process_time": 15.527
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 10.9
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 18.522
+            },
+            {
+              "id": "M06",
+              "process_time": 17.215
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 9.036
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.505
+            }
+          ]
+        }
+      ],
+      "reentry_steps": [
+        {
+          "process": "Clean",
+          "steps": [
+            0,
+            6,
+            11,
+            14,
+            19,
+            22,
+            25
+          ]
+        },
+        {
+          "process": "Deposition",
+          "steps": [
+            3,
+            8,
+            15,
+            20
+          ]
+        },
+        {
+          "process": "Etch",
+          "steps": [
+            2,
+            5,
+            9,
+            13,
+            18,
+            21
+          ]
+        },
+        {
+          "process": "Litho",
+          "steps": [
+            1,
+            7,
+            12,
+            16,
+            23
+          ]
+        },
+        {
+          "process": "Metrology",
+          "steps": [
+            4,
+            10,
+            17,
+            24
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P04",
+      "name": "Sensor-D",
+      "route": [
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 5.824
+            },
+            {
+              "id": "M10",
+              "process_time": 5.757
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 16.817
+            },
+            {
+              "id": "M06",
+              "process_time": 16.159
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 19.233
+            },
+            {
+              "id": "M09",
+              "process_time": 20.727
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 7.462
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 16.134
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 10.322
+            },
+            {
+              "id": "M10",
+              "process_time": 10.78
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 20.64
+            },
+            {
+              "id": "M06",
+              "process_time": 18.536
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 14.463
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 23.757
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 4.713
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 10.826
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 26.048
+            },
+            {
+              "id": "M06",
+              "process_time": 25.43
+            },
+            {
+              "id": "M07",
+              "process_time": 30.469
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 26.187
+            },
+            {
+              "id": "M09",
+              "process_time": 28.054
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 14.167
+            },
+            {
+              "id": "M08",
+              "process_time": 13.27
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 10.116
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 8.932
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 24.411
+            },
+            {
+              "id": "M06",
+              "process_time": 21.854
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 12.864
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 23.117
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 8.67
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 26.628
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 5.357
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 15.492
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 7.032
+            },
+            {
+              "id": "M10",
+              "process_time": 7.165
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 21.114
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 20.899
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 17.275
+            },
+            {
+              "id": "M08",
+              "process_time": 14.995
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.85
+            },
+            {
+              "id": "M10",
+              "process_time": 6.21
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 5.069
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 29.66
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 14.559
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 6.578
+            },
+            {
+              "id": "M11",
+              "process_time": 7.332
+            }
+          ]
+        }
+      ],
+      "reentry_steps": [
+        {
+          "process": "Clean",
+          "steps": [
+            0,
+            5,
+            10,
+            14,
+            19,
+            23,
+            27
+          ]
+        },
+        {
+          "process": "Deposition",
+          "steps": [
+            2,
+            8,
+            12,
+            18,
+            24,
+            29
+          ]
+        },
+        {
+          "process": "Etch",
+          "steps": [
+            4,
+            7,
+            13,
+            17,
+            22,
+            26
+          ]
+        },
+        {
+          "process": "Litho",
+          "steps": [
+            1,
+            6,
+            11,
+            16,
+            20,
+            25,
+            30
+          ]
+        },
+        {
+          "process": "Metrology",
+          "steps": [
+            3,
+            9,
+            15,
+            21,
+            28,
+            31
+          ]
+        }
+      ]
+    },
+    {
+      "id": "P05",
+      "name": "Power-E",
+      "route": [
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 26.672
+            },
+            {
+              "id": "M09",
+              "process_time": 28.323
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.609
+            },
+            {
+              "id": "M10",
+              "process_time": 6.645
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 17.567
+            },
+            {
+              "id": "M06",
+              "process_time": 14.592
+            },
+            {
+              "id": "M07",
+              "process_time": 18.872
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 16.294
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 7.167
+            },
+            {
+              "id": "M10",
+              "process_time": 6.402
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 6.456
+            },
+            {
+              "id": "M11",
+              "process_time": 7.541
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 21.595
+            },
+            {
+              "id": "M09",
+              "process_time": 23.03
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 22.337
+            },
+            {
+              "id": "M06",
+              "process_time": 21.554
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 16.732
+            },
+            {
+              "id": "M08",
+              "process_time": 14.806
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 8.983
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 20.36
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 7.548
+            },
+            {
+              "id": "M11",
+              "process_time": 8.264
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 21.692
+            },
+            {
+              "id": "M07",
+              "process_time": 25.521
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 14.672
+            },
+            {
+              "id": "M08",
+              "process_time": 12.111
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.788
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 27.132
+            },
+            {
+              "id": "M09",
+              "process_time": 30.139
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 22.361
+            },
+            {
+              "id": "M06",
+              "process_time": 21.651
+            },
+            {
+              "id": "M07",
+              "process_time": 24.707
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 16.784
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 8.649
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 6.862
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 28.017
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 9.964
+            },
+            {
+              "id": "M10",
+              "process_time": 8.378
+            }
+          ]
+        },
+        {
+          "process": "Litho",
+          "qualified_machines": [
+            {
+              "id": "M01",
+              "process_time": 22.861
+            },
+            {
+              "id": "M06",
+              "process_time": 20.2
+            },
+            {
+              "id": "M07",
+              "process_time": 25.116
+            }
+          ]
+        },
+        {
+          "process": "Etch",
+          "qualified_machines": [
+            {
+              "id": "M02",
+              "process_time": 16.49
+            }
+          ]
+        },
+        {
+          "process": "Deposition",
+          "qualified_machines": [
+            {
+              "id": "M03",
+              "process_time": 26.994
+            }
+          ]
+        },
+        {
+          "process": "Metrology",
+          "qualified_machines": [
+            {
+              "id": "M05",
+              "process_time": 6.154
+            },
+            {
+              "id": "M11",
+              "process_time": 7.519
+            }
+          ]
+        },
+        {
+          "process": "Clean",
+          "qualified_machines": [
+            {
+              "id": "M04",
+              "process_time": 8.391
+            }
+          ]
+        }
+      ],
+      "reentry_steps": [
+        {
+          "process": "Clean",
+          "steps": [
+            1,
+            4,
+            9,
+            14,
+            19,
+            21,
+            26
+          ]
+        },
+        {
+          "process": "Deposition",
+          "steps": [
+            0,
+            6,
+            10,
+            15,
+            20,
+            24
+          ]
+        },
+        {
+          "process": "Etch",
+          "steps": [
+            3,
+            8,
+            13,
+            17,
+            23
+          ]
+        },
+        {
+          "process": "Litho",
+          "steps": [
+            2,
+            7,
+            12,
+            16,
+            22
+          ]
+        },
+        {
+          "process": "Metrology",
+          "steps": [
+            5,
+            11,
+            18,
+            25
+          ]
+        }
+      ]
+    }
+  ]
+}

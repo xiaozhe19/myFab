@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib import request
 
-from fab_orders import FabOrderPool
+from order.pool import FabOrderPool
 
 
 @dataclass
@@ -71,7 +71,7 @@ class WaferState:
 
     @property
     def current_process_time(self) -> float | None:
-        """当前 route step 自己定义的加工时间。"""
+        """当前 route step 的最短 qualified 加工时间，用于策略估算。"""
 
         if self.completed:
             return None
@@ -92,6 +92,16 @@ class WaferState:
         if self.completed:
             return None
         return f"{self.product_id}:{self.step}"
+
+    def process_time_for_machine(self, machine_id: str) -> float | None:
+        """返回当前 step 在指定 machine 上的加工时间。"""
+
+        if self.completed:
+            return None
+        for option in self.route[self.step]["qualified_machines"]:
+            if option["id"] == machine_id:
+                return float(option["process_time"])
+        return None
 
 
 @dataclass
@@ -212,12 +222,306 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def save_result(result: dict[str, Any], path: Path) -> None:
-    """把仿真结果保存成 dashboard 可以读取的 JSON。"""
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(result, file, indent=2, ensure_ascii=False)
+
+def _average(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _result_detail_path(path: Path) -> Path:
+    if path.stem.endswith("_result"):
+        return path.with_name(f"{path.stem[:-7]}_detail{path.suffix}")
+    return path.with_name(f"{path.stem}_detail{path.suffix}")
+
+
+def _dump_json(payload: dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, ensure_ascii=False)
         file.write("\n")
+    tmp_path.replace(path)
+
+
+def _result_window(result: dict[str, Any]) -> tuple[float, float, float]:
+    measurement = result.get("measurement", {})
+    start = _as_float(
+        measurement.get(
+            "measurement_start_time",
+            result.get("measurement_start_time"),
+        )
+    )
+    end = _as_float(
+        measurement.get(
+            "measurement_end_time",
+            result.get("current_time"),
+        )
+    )
+    horizon = _as_float(measurement.get("measurement_horizon"), end - start)
+    return start, end, max(horizon, 0.0)
+
+
+def _compact_wafer(wafer: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": wafer.get("id"),
+        "order_id": wafer.get("order_id"),
+        "product_id": wafer.get("product_id"),
+        "product_name": wafer.get("product_name"),
+        "generation_time": wafer.get("generation_time"),
+        "release_time": wafer.get("release_time"),
+        "due_time": wafer.get("due_time"),
+        "priority": wafer.get("priority"),
+        "start_time": wafer.get("start_time"),
+        "end_time": wafer.get("end_time"),
+        "completed": wafer.get("completed"),
+        "step": wafer.get("step"),
+        "in_process": wafer.get("in_process"),
+        "processing_machine_id": wafer.get("processing_machine_id"),
+        "processing_end_time": wafer.get("processing_end_time"),
+    }
+
+
+def _build_operation_summary(result: dict[str, Any]) -> dict[str, Any]:
+    _, _, horizon = _result_window(result)
+    machines = {
+        str(machine.get("id")): dict(machine)
+        for machine in result.get("machines", [])
+        if machine.get("id") is not None
+    }
+    processing_by_machine: dict[str, float] = {machine_id: 0.0 for machine_id in machines}
+    setup_by_machine: dict[str, float] = {machine_id: 0.0 for machine_id in machines}
+    downtime_by_machine: dict[str, float] = {machine_id: 0.0 for machine_id in machines}
+    operation_count_by_machine: dict[str, int] = {machine_id: 0 for machine_id in machines}
+
+    for event in result.get("operations", []):
+        machine_id = str(event.get("machine_id", "Unknown"))
+        duration = _as_float(event.get("duration"), _as_float(event.get("end")) - _as_float(event.get("start")))
+        if event.get("kind") == "setup":
+            setup_by_machine[machine_id] = setup_by_machine.get(machine_id, 0.0) + duration
+        elif event.get("kind", "process") == "process":
+            processing_by_machine[machine_id] = processing_by_machine.get(machine_id, 0.0) + duration
+            operation_count_by_machine[machine_id] = operation_count_by_machine.get(machine_id, 0) + 1
+
+    for event in result.get("machine_events", []):
+        machine_id = str(event.get("machine_id", "Unknown"))
+        duration = _as_float(event.get("duration"), _as_float(event.get("end")) - _as_float(event.get("start")))
+        if event.get("kind") == "downtime":
+            downtime_by_machine[machine_id] = downtime_by_machine.get(machine_id, 0.0) + duration
+
+    utilization_rows = []
+    for machine_id, machine in machines.items():
+        processing = processing_by_machine.get(machine_id, 0.0)
+        setup = setup_by_machine.get(machine_id, 0.0)
+        downtime = downtime_by_machine.get(machine_id, 0.0)
+        utilization = processing / horizon if horizon > 0 else 0.0
+        utilization_rows.append(
+            {
+                "id": machine_id,
+                "name": machine.get("name", machine_id),
+                "type": machine.get("type", "Unknown"),
+                "busy_time": round(processing, 3),
+                "processing_time": round(processing, 3),
+                "setup_time": round(setup, 3),
+                "downtime": round(downtime, 3),
+                "utilization": round(utilization, 4),
+                "downtime_ratio": round(downtime / horizon, 4) if horizon > 0 else 0.0,
+                "operation_count": operation_count_by_machine.get(machine_id, 0),
+            }
+        )
+
+    utilization_values = [row["utilization"] for row in utilization_rows]
+    return {
+        "machine_utilization": {
+            "average": round(_average(utilization_values), 4),
+            "min": round(min(utilization_values), 4) if utilization_values else 0.0,
+            "max": round(max(utilization_values), 4) if utilization_values else 0.0,
+            "machines": utilization_rows,
+        },
+        "totals": {
+            "process_time": round(sum(processing_by_machine.values()), 3),
+            "setup_time": round(sum(setup_by_machine.values()), 3),
+            "downtime": round(sum(downtime_by_machine.values()), 3),
+        },
+    }
+
+
+def _build_queue_summary(result: dict[str, Any]) -> list[dict[str, Any]]:
+    measurement_start, measurement_end, _ = _result_window(result)
+    queue_groups: dict[str, list[float]] = {}
+    for sample in result.get("queue_samples", []):
+        sample_time = _as_float(sample.get("time"))
+        if measurement_start <= sample_time <= measurement_end:
+            queue = str(sample.get("queue", "Unknown"))
+            queue_groups.setdefault(queue, []).append(_as_float(sample.get("length")))
+    return [
+        {
+            "queue": queue,
+            "average_length": round(_average(values), 3),
+            "max_length": max(values) if values else 0,
+            "sample_count": len(values),
+        }
+        for queue, values in sorted(queue_groups.items())
+    ]
+
+
+def _build_wait_summary(result: dict[str, Any]) -> list[dict[str, Any]]:
+    waits_by_process: dict[str, list[float]] = {}
+    for wafer in result.get("wafers", []):
+        history = sorted(
+            wafer.get("operation_history", []),
+            key=lambda item: (_as_float(item.get("start")), int(item.get("step", 0))),
+        )
+        last_ready = _as_float(wafer.get("release_time"))
+        index = 0
+        while index < len(history):
+            operation = history[index]
+            process_name = str(operation.get("process", "Unknown"))
+            step_key = operation.get("step")
+            group_start = _as_float(operation.get("start"))
+            group_end = _as_float(operation.get("end"))
+            group_last = index
+            probe = index + 1
+            while (
+                probe < len(history)
+                and history[probe].get("step") == step_key
+                and str(history[probe].get("process", "Unknown")) == process_name
+            ):
+                group_end = max(group_end, _as_float(history[probe].get("end")))
+                group_last = probe
+                probe += 1
+
+            waits_by_process.setdefault(process_name, []).append(max(group_start - last_ready, 0.0))
+            last_ready = group_end
+            index = group_last + 1
+
+    return [
+        {
+            "process": process,
+            "average_wait": round(_average(values), 3),
+            "max_wait": round(max(values), 3) if values else 0.0,
+        }
+        for process, values in sorted(waits_by_process.items())
+    ]
+
+
+def _build_bottleneck_summary(
+    utilization_rows: list[dict[str, Any]],
+    queue_rows: list[dict[str, Any]],
+    wait_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    bottlenecks: list[dict[str, Any]] = []
+    for row in utilization_rows:
+        bottlenecks.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "kind": "machine",
+                "score": row["utilization"],
+                "reason": f"utilization {row['utilization'] * 100:.1f}%",
+            }
+        )
+    for row in queue_rows:
+        bottlenecks.append(
+            {
+                "id": row["queue"],
+                "name": row["queue"],
+                "kind": "queue",
+                "score": round(row["average_length"] + row["max_length"], 4),
+                "reason": f"avg queue {row['average_length']}, max {row['max_length']}",
+            }
+        )
+    for row in wait_rows:
+        bottlenecks.append(
+            {
+                "id": row["process"],
+                "name": row["process"],
+                "kind": "process",
+                "score": round(row["average_wait"] + row["max_wait"], 4),
+                "reason": f"avg wait {row['average_wait']}, max {row['max_wait']}",
+            }
+        )
+    return sorted(bottlenecks, key=lambda item: item["score"], reverse=True)[:8]
+
+
+def build_result_overview(result: dict[str, Any], detail_path: Path | None = None) -> dict[str, Any]:
+    operation_summary = _build_operation_summary(result)
+    queue_rows = _build_queue_summary(result)
+    wait_rows = _build_wait_summary(result)
+    overview = {
+        key: deepcopy(result.get(key))
+        for key in (
+            "run_id",
+            "task_id",
+            "factory_id",
+            "strategy",
+            "time_unit",
+            "generated_at",
+            "current_time",
+            "warmup_time",
+            "measurement_start_time",
+            "fab_parameters",
+            "measurement",
+            "machines",
+            "products",
+            "waiting_list",
+        )
+        if key in result
+    }
+    overview.update(
+        {
+            "result_kind": "overview",
+            "result_format_version": 2,
+            "detail_path": str(detail_path) if detail_path is not None else None,
+            "wafers": [_compact_wafer(wafer) for wafer in result.get("wafers", [])],
+            "operations": [],
+            "machine_events": [],
+            "queue_samples": [],
+            "order_events": [],
+            "release_events": deepcopy(result.get("release_events", [])),
+            "last_operation_completion": {},
+            "operation_summary": operation_summary,
+            "queue_summary": queue_rows,
+            "wait_by_process_summary": wait_rows,
+            "bottleneck_summary": _build_bottleneck_summary(
+                operation_summary["machine_utilization"]["machines"],
+                queue_rows,
+                wait_rows,
+            ),
+        }
+    )
+    for key, value in result.items():
+        if (
+            key.startswith("dbr_")
+            and not key.endswith("_samples")
+        ) or key in {"drum_process", "release_policy", "buffer_policy"}:
+            overview[key] = deepcopy(value)
+    return overview
+
+
+def save_result(result: dict[str, Any], path: Path) -> None:
+    """保存结果包：轻量 overview 给看板，完整 detail 给 debug/AI 分析。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    detail_path = _result_detail_path(path)
+    overview = build_result_overview(
+        result,
+        detail_path=Path(detail_path.name),
+    )
+    _dump_json(
+        {
+            "result_kind": "detail",
+            "result_format_version": 2,
+            "overview_path": path.name,
+            **result,
+        },
+        detail_path,
+    )
+    _dump_json(overview, path)
 
 
 def post_result(result: dict[str, Any], url: str) -> None:
@@ -285,13 +589,14 @@ def build_machine_state(
 
 def normalize_route(
     product: dict[str, Any],
+    machine_types_by_id: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """
     校验并复制产品路线。
 
     每一个 route step 必须自己包含：
     - process：需要的设备类型
-    - process_time：该产品在该步骤的加工时间
+    - qualified_machines：可加工该 step 的 machine 列表，每项包含 id 和 process_time
     """
 
     product_id = str(product.get("id", "<unknown>"))
@@ -304,32 +609,85 @@ def normalize_route(
         if not isinstance(operation, dict):
             raise ValueError(
                 f"Product {product_id} route step {step} must be an object "
-                "with process and process_time."
+                "with process and qualified_machines."
             )
         if not operation.get("process"):
             raise ValueError(
                 f"Product {product_id} route step {step} is missing process."
             )
-        if "process_time" not in operation:
+        qualified_machines = operation.get("qualified_machines")
+        if not isinstance(qualified_machines, list) or not qualified_machines:
             raise ValueError(
-                f"Product {product_id} route step {step} is missing process_time."
+                f"Product {product_id} route step {step} must contain "
+                "a non-empty qualified_machines list."
             )
 
-        process_time = float(operation["process_time"])
-        if process_time <= 0:
-            raise ValueError(
-                f"Product {product_id} route step {step} process_time "
-                "must be greater than zero."
+        normalized_options: list[dict[str, Any]] = []
+        for option_index, option in enumerate(qualified_machines):
+            if not isinstance(option, dict):
+                raise ValueError(
+                    f"Product {product_id} route step {step} qualified machine "
+                    f"#{option_index} must be an object."
+                )
+            machine_id = option.get("id")
+            if not machine_id:
+                raise ValueError(
+                    f"Product {product_id} route step {step} qualified machine "
+                    f"#{option_index} is missing id."
+                )
+            machine_id = str(machine_id)
+            if machine_types_by_id is not None:
+                machine_type = machine_types_by_id.get(machine_id)
+                if machine_type is None:
+                    raise ValueError(
+                        f"Product {product_id} route step {step} references "
+                        f"unknown machine {machine_id}."
+                    )
+                if machine_type != str(operation["process"]):
+                    raise ValueError(
+                        f"Product {product_id} route step {step} process "
+                        f"{operation['process']} cannot run on {machine_id} "
+                        f"because it is a {machine_type} machine."
+                    )
+            if "process_time" not in option:
+                raise ValueError(
+                    f"Product {product_id} route step {step} qualified machine "
+                    f"{machine_id} is missing process_time."
+                )
+            process_time = float(option["process_time"])
+            if process_time <= 0:
+                raise ValueError(
+                    f"Product {product_id} route step {step} qualified machine "
+                    f"{machine_id} process_time must be greater than zero."
+                )
+            normalized_options.append(
+                {
+                    **option,
+                    "id": machine_id,
+                    "process_time": process_time,
+                }
             )
 
         normalized.append(
             {
                 **operation,
                 "process": str(operation["process"]),
-                "process_time": process_time,
+                "qualified_machines": normalized_options,
+                "process_time": sum(
+                    option["process_time"] for option in normalized_options
+                )
+                / len(normalized_options),
             }
         )
     return normalized
+
+
+def machine_can_process(machine: MachineState, wafer: WaferState) -> bool:
+    """判断 machine 是否有资格加工 wafer 当前 step。"""
+
+    if wafer.completed or wafer.current_process != machine.type:
+        return False
+    return wafer.process_time_for_machine(machine.id) is not None
 
 
 def build_states(
@@ -341,9 +699,6 @@ def build_states(
     这一步所有策略都一样，所以放在 core 里。
     """
 
-    products = {
-        product["id"]: product for product in factory_config["products"]
-    }
     downtime = factory_config.get("machine_downtime", {})
     downtime_seed = int(
         downtime.get("random_seed", 0)
@@ -353,6 +708,15 @@ def build_states(
         build_machine_state(machine, downtime, downtime_seed, index)
         for index, machine in enumerate(factory_config["machines"])
     ]
+    machine_types_by_id = {machine.id: machine.type for machine in machines}
+
+    products = {
+        product["id"]: {
+            **product,
+            "route": normalize_route(product, machine_types_by_id),
+        }
+        for product in factory_config["products"]
+    }
 
     wafers: list[WaferState] = []
     for index, wafer in enumerate(factory_config.get("wafers", [])):
@@ -363,7 +727,7 @@ def build_states(
                 id=wafer["id"],
                 product_id=wafer["product_id"],
                 product_name=product.get("name", wafer["product_id"]),
-                route=normalize_route(product),
+                route=products[product["id"]]["route"],
                 generation_time=float(wafer.get("generation_time", release_time)),
                 release_time=release_time,
                 due_time=(
@@ -405,12 +769,13 @@ def create_order_lot(
 
 
 def ready_candidates(
-    wafers: list[WaferState], machine_type: str, current_time: float
+    wafers: list[WaferState], machine: MachineState, current_time: float
 ) -> list[WaferState]:
     """
     找出当前机器可加工的候选 wafer。
 
-    策略文件通常第一步都会调用它，然后只负责排序。
+    策略传入具体 MachineState；这里按 recipe 的 qualified_machines
+    精确过滤，策略只在合法候选中排序和选择。
     """
 
     return [
@@ -419,7 +784,7 @@ def ready_candidates(
         if not wafer.completed
         and not wafer.in_process
         and wafer.ready_time <= current_time
-        and wafer.current_process == machine_type
+        and machine_can_process(machine, wafer)
     ]
 
 
@@ -808,7 +1173,7 @@ class FabSimulationEngine:
                     wafer.completed
                     or wafer.in_process
                     or wafer.ready_time > current_time
-                    or wafer.current_process != machine.type
+                    or not machine_can_process(machine, wafer)
                 ):
                     raise ValueError(
                         f"Strategy {self.strategy_name} returned invalid assignment "
@@ -818,7 +1183,7 @@ class FabSimulationEngine:
 
                 process_name = wafer.current_process
                 operation_id = wafer.current_operation_id
-                process_duration = wafer.current_process_time
+                process_duration = wafer.process_time_for_machine(machine.id)
                 if (
                     process_name is None
                     or operation_id is None

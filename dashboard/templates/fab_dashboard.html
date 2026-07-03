@@ -13,10 +13,10 @@
         <h1>Fab 调度策略看板</h1>
       </div>
       <div class="topbar-right">
-        <label class="result-picker" for="result-select">
+        <div class="result-tabs-wrap" aria-label="Result tabs">
           <span>Result</span>
-          <select id="result-select" aria-label="选择要显示的 result"></select>
-        </label>
+          <div id="result-tabs" class="result-tabs" role="tablist" aria-label="选择要显示的 result"></div>
+        </div>
         <div class="run-meta">
           <span id="strategy">strategy</span>
           <strong id="run-id">run</strong>
@@ -54,6 +54,23 @@
         </article>
       </section>
 
+      <section class="simulation-panel" aria-label="运行策略模拟">
+        <div class="simulation-field">
+          <span>Strategy</span>
+          <select id="simulation-strategy" aria-label="选择策略"></select>
+        </div>
+        <label class="simulation-field" for="simulation-seed">
+          <span>Seed Index</span>
+          <input id="simulation-seed" type="number" min="1" step="1" value="1">
+        </label>
+        <label class="simulation-field output-field" for="simulation-output">
+          <span>Output</span>
+          <input id="simulation-output" type="text" value="simulation_result.json">
+        </label>
+        <button id="run-simulation" class="primary inline-primary" type="button">运行策略模拟</button>
+        <p id="simulation-status" class="status"></p>
+      </section>
+
       <section class="metric-grid" aria-label="算法对比指标">
         <article class="metric-card">
           <span>MCT Average</span>
@@ -61,9 +78,9 @@
           <small id="cycle-detail">P50 0 · P90 0 · Max 0</small>
         </article>
         <article class="metric-card">
-          <span>Movement</span>
-          <strong id="movement-count">0</strong>
-          <small id="movement-detail">Rate 0 / time</small>
+          <span>Completion Ratio</span>
+          <strong id="completion-ratio">0%</strong>
+          <small id="movement-detail">Movement 0</small>
         </article>
         <article class="metric-card">
           <span>Throughput</span>
@@ -80,6 +97,44 @@
           <strong id="released-count">0</strong>
           <small id="released-detail">Rate 0 · Pool 0</small>
         </article>
+        <article class="metric-card">
+          <span>Setup / Process</span>
+          <strong id="setup-ratio">0%</strong>
+          <small id="setup-detail">Setup 0 · Process 0</small>
+        </article>
+      </section>
+
+      <section class="diagnosis-grid" aria-label="流动诊断">
+        <div class="panel">
+          <div class="panel-heading">
+            <div class="panel-title">
+              <h2>Machine Utilization</h2>
+              <span id="utilization-summary">Avg 0 · Max 0</span>
+            </div>
+          </div>
+          <div id="utilization-bars" class="bar-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <h2>Queue Length</h2>
+          </div>
+          <div id="queue-bars" class="bar-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <h2>Wait By Process</h2>
+          </div>
+          <div id="wait-bars" class="bar-list"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-heading">
+            <h2>Bottleneck Signals</h2>
+          </div>
+          <div id="bottlenecks" class="rank-list"></div>
+        </div>
       </section>
 
       <section class="panel product-panel" aria-label="产品表现">
@@ -89,6 +144,9 @@
         </div>
         <div id="product-performance" class="product-performance"></div>
       </section>
+
+      <details id="debug-section" class="debug-section">
+        <summary>Debug & Detailed Trace</summary>
 
       <section class="panel animation-panel" aria-label="调度动画">
         <div class="panel-heading">
@@ -138,10 +196,13 @@
         </div>
       </section>
 
-      <section class="panel order-panel" aria-label="订单到达历史">
+      <section class="panel order-panel is-collapsed" aria-label="订单到达历史">
         <div class="panel-heading">
-          <h2>Order Arrival History</h2>
-          <span>每张订单的到达时间、lot 数与产品组成</span>
+          <div class="panel-title">
+            <h2>Order Arrival History</h2>
+            <span id="order-history-summary">0 orders</span>
+          </div>
+          <button id="order-history-toggle" type="button" aria-expanded="false" aria-controls="order-history">展开</button>
         </div>
         <div id="order-history" class="order-history"></div>
       </section>
@@ -171,27 +232,6 @@
 
         <div class="panel">
           <div class="panel-heading">
-            <h2>Machine Utilization</h2>
-          </div>
-          <div id="utilization-bars" class="bar-list"></div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-heading">
-            <h2>Queue Length</h2>
-          </div>
-          <div id="queue-bars" class="bar-list"></div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-heading">
-            <h2>Bottleneck Identification</h2>
-          </div>
-          <div id="bottlenecks" class="rank-list"></div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-heading">
             <h2>API Ingestion</h2>
             <button id="load-sample" type="button">载入示例</button>
           </div>
@@ -200,6 +240,7 @@
           <p id="submit-status" class="status"></p>
         </div>
       </section>
+      </details>
     </main>
 
     <script src="{{ url_for('static', filename='fab_dashboard.js') }}"></script>

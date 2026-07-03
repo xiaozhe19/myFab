@@ -7,7 +7,8 @@ const timelineState = {
 
 const dashboardState = {
   resultId: "current",
-  resultsLoaded: false,
+  results: [],
+  cache: {},
 };
 
 const animationState = {
@@ -30,6 +31,10 @@ function fmt(value, digits = 2) {
   return Number(value).toFixed(digits).replace(/\.?0+$/, "");
 }
 
+function displayTime(value, data) {
+  return Number(value || 0) - Number(data.run.window_start || 0);
+}
+
 function pct(value) {
   return `${fmt(Number(value) * 100, 1)}%`;
 }
@@ -44,11 +49,18 @@ function renderDashboard(data) {
   renderSystemStructure(data);
   renderProductPerformance(data);
   renderOrderHistory(data);
-  renderScheduleAnimation(data);
-  renderTimeline(data);
   renderUtilization(data);
   renderQueues(data);
+  renderWaitByProcess(data);
   renderBottlenecks(data);
+  renderDebugPanels(data);
+}
+
+function renderDebugPanels(data) {
+  const debug = document.getElementById("debug-section");
+  if (!debug || !debug.open) return;
+  renderScheduleAnimation(data);
+  renderTimeline(data);
 }
 
 function setTimelineZoom(scale) {
@@ -128,21 +140,22 @@ async function getJson(url, options) {
 
 function renderMetricCards(data) {
   const business = data.business;
+  const efficiency = business.efficiency || {};
   setText("strategy", data.run.strategy);
   setText("run-id", data.run.run_id);
   setText("horizon", `measurement ${fmt(data.run.horizon)} ${data.run.time_unit}`);
   setText("warmup-time", `${fmt(data.run.warmup_time)} ${data.run.time_unit}`);
-  setText("measurement-window", `${fmt(data.run.window_start)} → ${fmt(data.run.window_end)}`);
+  setText("measurement-window", `0 → ${fmt(data.run.horizon)}`);
   setText("measurement-duration", `${fmt(data.run.horizon)} ${data.run.time_unit}`);
   setText("cycle-avg", fmt(business.mct.average));
   setText(
     "cycle-detail",
     `P50 ${fmt(business.mct.p50)} · P90 ${fmt(business.mct.p90)} · Max ${fmt(business.mct.max)}`
   );
-  setText("movement-count", business.movement.count);
-  setText("movement-detail", `Rate ${fmt(business.movement.rate, 4)} / ${data.run.time_unit}`);
   setText("throughput-count", business.throughput.completed);
   setText("throughput-detail", `Rate ${fmt(business.throughput.rate, 4)} / ${data.run.time_unit}`);
+  setText("completion-ratio", pct(business.throughput.completion_ratio || 0));
+  setText("movement-detail", `Movement ${business.movement.count} · Rate ${fmt(business.movement.rate, 4)}`);
   setText("average-wip", fmt(business.wip.average));
   setText("released-count", business.release.count);
   const waitingCapacity = Number(business.release.waiting_capacity || 0) > 0
@@ -151,6 +164,11 @@ function renderMetricCards(data) {
   setText(
     "released-detail",
     `Rate ${fmt(business.release.rate, 4)} · Backlog ${business.release.waiting_backlog || 0} / ${waitingCapacity}`
+  );
+  setText("setup-ratio", pct(efficiency.setup_to_process_ratio || 0));
+  setText(
+    "setup-detail",
+    `Setup ${fmt(efficiency.setup_time)} · Process ${fmt(efficiency.process_time)}`
   );
 }
 
@@ -207,7 +225,7 @@ function renderTimeline(data) {
     tick.style.left = `${((tickTime - startBase) / horizon) * 100}%`;
     if (i === 0) tick.classList.add("is-start");
     if (i === tickCount) tick.classList.add("is-end");
-    tick.textContent = `${fmt(tickTime, 0)}`;
+    tick.textContent = `${fmt(tickTime - startBase, 0)}`;
     axisTrack.appendChild(tick);
   }
   axis.append(axisLabel, axisTrack);
@@ -262,13 +280,13 @@ function renderTimeline(data) {
       block.style.height = `${blockHeight}px`;
       if (kind === "process") {
         block.style.background = palette[index % palette.length];
-        block.title = `${op.wafer_id} · ${op.process}: ${op.start} -> ${op.end}`;
+        block.title = `${op.wafer_id} · ${op.process}: ${fmt(Number(op.start) - startBase)} -> ${fmt(Number(op.end) - startBase)}`;
         block.textContent = widthPx >= timelineLayout.labelWidthThreshold ? op.wafer_id || "" : "";
       } else if (kind === "setup") {
-        block.title = `setup ${op.from_product_id || "None"} -> ${op.to_product_id}: ${op.start} -> ${op.end}`;
+        block.title = `setup ${op.from_product_id || "None"} -> ${op.to_product_id}: ${fmt(Number(op.start) - startBase)} -> ${fmt(Number(op.end) - startBase)}`;
         block.textContent = widthPx >= timelineLayout.labelWidthThreshold ? "SET" : "";
       } else if (kind === "downtime") {
-        block.title = `downtime · ${op.reason || "failure"}: ${op.start} -> ${op.end}`;
+        block.title = `downtime · ${op.reason || "failure"}: ${fmt(Number(op.start) - startBase)} -> ${fmt(Number(op.end) - startBase)}`;
         block.textContent = widthPx >= timelineLayout.labelWidthThreshold ? "DOWN" : "";
       }
       track.appendChild(block);
@@ -377,8 +395,10 @@ function orderProductCounts(order) {
 
 function renderOrderHistory(data) {
   const root = document.getElementById("order-history");
+  const summary = document.getElementById("order-history-summary");
   root.innerHTML = "";
   const orders = (data.raw.order_events || []).filter((order) => order.accepted);
+  summary.textContent = `${orders.length} orders`;
   if (orders.length === 0) {
     root.innerHTML = '<p class="status">当前结果没有订单到达记录。</p>';
     return;
@@ -394,12 +414,34 @@ function renderOrderHistory(data) {
     card.innerHTML = `
       <div class="order-card-head">
         <strong>${order.order_id || "Order"}</strong>
-        <span>t=${fmt(order.time)} ${data.run.time_unit}</span>
+        <span>t=${fmt(displayTime(order.time, data))} ${data.run.time_unit}</span>
       </div>
       <div class="order-mix">${mix}</div>
       <small>${order.quantity || 0} lots · queue after arrival ${order.queue_size || 0}</small>
     `;
     root.appendChild(card);
+  });
+}
+
+function attachOrderHistoryToggle() {
+  const panel = document.querySelector(".order-panel");
+  const button = document.getElementById("order-history-toggle");
+  button.addEventListener("click", () => {
+    const collapsed = panel.classList.toggle("is-collapsed");
+    button.setAttribute("aria-expanded", String(!collapsed));
+    button.textContent = collapsed ? "展开" : "收起";
+  });
+}
+
+function attachDebugToggle() {
+  const debug = document.getElementById("debug-section");
+  if (!debug) return;
+  debug.addEventListener("toggle", () => {
+    if (debug.open && window.__fabDashboardData) {
+      renderDebugPanels(window.__fabDashboardData);
+    } else {
+      stopAnimation();
+    }
   });
 }
 
@@ -423,6 +465,8 @@ function barRow(labelText, valueText, ratio, color) {
 function renderUtilization(data) {
   const root = document.getElementById("utilization-bars");
   root.innerHTML = "";
+  const utilization = data.health.machine_utilization || {};
+  setText("utilization-summary", `Avg ${pct(utilization.average || 0)} · Max ${pct(utilization.max || 0)}`);
   data.health.machine_utilization.machines
     .slice()
     .sort((a, b) => b.utilization - a.utilization)
@@ -433,6 +477,26 @@ function renderUtilization(data) {
           `${pct(machine.utilization)} · setup ${fmt(machine.setup_time)} · down ${pct(machine.downtime_ratio || 0)}`,
           machine.utilization,
           "var(--accent)"
+        )
+      );
+    });
+}
+
+function renderWaitByProcess(data) {
+  const root = document.getElementById("wait-bars");
+  root.innerHTML = "";
+  const rows = data.health.wait_by_process || [];
+  const maxWait = Math.max(...rows.map((row) => Number(row.max_wait)), 1);
+  rows
+    .slice()
+    .sort((a, b) => b.max_wait - a.max_wait)
+    .forEach((row) => {
+      root.appendChild(
+        barRow(
+          row.process,
+          `Avg ${fmt(row.average_wait)} · Max ${fmt(row.max_wait)}`,
+          row.max_wait / maxWait,
+          "var(--warn)"
         )
       );
     });
@@ -691,7 +755,7 @@ function updateWaitingList(data, currentTime) {
       </div>
       <div class="waiting-order-mix">${mix}</div>
     `;
-    item.title = `arrived ${fmt(order.generation_time)} · ${order.lots.length} lots remaining`;
+    item.title = `arrived ${fmt(displayTime(order.generation_time, data))} · ${order.lots.length} lots remaining`;
     root.appendChild(item);
   });
   if (orders.length > 12) {
@@ -704,7 +768,7 @@ function updateWaitingList(data, currentTime) {
 
 function updateScheduleAnimation(data) {
   const currentTime = animationState.times[animationState.timeIndex] || 0;
-  setText("animation-clock", `time ${fmt(currentTime)} ${data.run.time_unit}`);
+  setText("animation-clock", `time ${fmt(displayTime(currentTime, data))} ${data.run.time_unit}`);
   updateWaitingList(data, currentTime);
 
   (data.timeline.machines || []).forEach((machine) => {
@@ -727,7 +791,7 @@ function updateScheduleAnimation(data) {
     row.classList.add(`is-${kind}`);
     status.textContent = kind === "process" ? event.process || machine.type || "Process" : kind;
     wafer.textContent = kind === "process" ? event.wafer_id || "-" : `${event.from_product_id || ""}→${event.to_product_id || ""}`;
-    windowText.textContent = `${fmt(event.start)} -> ${fmt(event.end)}`;
+    windowText.textContent = `${fmt(displayTime(event.start, data))} -> ${fmt(displayTime(event.end, data))}`;
   });
 
 }
@@ -763,44 +827,79 @@ function attachAnimationControls() {
 
 async function refresh() {
   stopAnimation();
+  if (dashboardState.cache[dashboardState.resultId]) {
+    renderDashboard(dashboardState.cache[dashboardState.resultId]);
+    return;
+  }
   const suffix = dashboardState.resultId && dashboardState.resultId !== "current" ? `?result=${encodeURIComponent(dashboardState.resultId)}` : "";
   const data = await getJson(`/api/dashboard${suffix}`);
+  dashboardState.cache[dashboardState.resultId] = data;
   renderDashboard(data);
 }
 
-async function loadResultOptions() {
-  const menu = document.getElementById("result-select");
-  const response = await getJson("/api/results");
-  menu.innerHTML = "";
-  response.results.forEach((item) => {
-    const option = document.createElement("option");
-    option.value = item.id;
-    option.textContent = item.label || item.id;
-    menu.appendChild(option);
+function activateResultTab() {
+  document.querySelectorAll(".result-tab").forEach((tab) => {
+    const active = tab.dataset.resultId === dashboardState.resultId;
+    tab.classList.toggle("is-active", active);
+    tab.setAttribute("aria-selected", active ? "true" : "false");
   });
-  dashboardState.resultId = response.selected || "current";
-  if (![...menu.options].some((option) => option.value === dashboardState.resultId)) {
-    dashboardState.resultId = menu.options[0] ? menu.options[0].value : "current";
-  }
-  menu.value = dashboardState.resultId;
-  if (!dashboardState.resultsLoaded) {
-    menu.addEventListener("change", async () => {
-      dashboardState.resultId = menu.value;
-      try {
-        await refresh();
-      } catch (error) {
-        document.getElementById("submit-status").textContent = `切换结果失败：${error.message}`;
-      }
-    });
-    dashboardState.resultsLoaded = true;
+}
+
+async function selectResult(resultId) {
+  dashboardState.resultId = resultId;
+  activateResultTab();
+  try {
+    await refresh();
+  } catch (error) {
+    document.getElementById("submit-status").textContent = `切换结果失败：${error.message}`;
   }
 }
 
-function setCurrentResultOption() {
-  const menu = document.getElementById("result-select");
-  if (menu && dashboardState.resultId) {
-    menu.value = dashboardState.resultId;
+async function loadResultTabs(preferredResultId) {
+  const tabs = document.getElementById("result-tabs");
+  const query = preferredResultId ? `?result=${encodeURIComponent(preferredResultId)}` : "";
+  const response = await getJson(`/api/results${query}`);
+  dashboardState.results = response.results || [];
+  tabs.innerHTML = "";
+  dashboardState.results.forEach((item) => {
+    const button = document.createElement("button");
+    button.className = "result-tab";
+    button.type = "button";
+    button.role = "tab";
+    button.dataset.resultId = item.id;
+    button.textContent = item.label || item.id;
+    button.title = item.generated_at ? `Generated ${item.generated_at}` : item.id;
+    button.addEventListener("click", () => selectResult(item.id));
+    tabs.appendChild(button);
+  });
+  dashboardState.resultId = response.selected || "current";
+  if (![...tabs.querySelectorAll(".result-tab")].some((tab) => tab.dataset.resultId === dashboardState.resultId)) {
+    dashboardState.resultId = dashboardState.results[0] ? dashboardState.results[0].id : "current";
   }
+  activateResultTab();
+}
+
+async function loadStrategyOptions() {
+  const menu = document.getElementById("simulation-strategy");
+  const response = await getJson("/api/strategies");
+  menu.innerHTML = "";
+  response.strategies.forEach((strategy) => {
+    const option = document.createElement("option");
+    option.value = strategy.id;
+    option.textContent = strategy.label;
+    menu.appendChild(option);
+  });
+  updateSimulationOutputName();
+  menu.addEventListener("change", updateSimulationOutputName);
+}
+
+function updateSimulationOutputName() {
+  const strategyId = document.getElementById("simulation-strategy").value || "simulation";
+  document.getElementById("simulation-output").value = `${strategyId}_result.json`;
+}
+
+function setCurrentResultOption() {
+  activateResultTab();
 }
 
 async function loadSamplePayload() {
@@ -820,6 +919,9 @@ async function submitRun() {
     });
     status.textContent = "已更新看板。";
     dashboardState.resultId = "current";
+    dashboardState.cache.current = data.dashboard;
+    await loadResultTabs();
+    dashboardState.resultId = "current";
     setCurrentResultOption();
     renderDashboard(data.dashboard);
   } catch (error) {
@@ -827,12 +929,45 @@ async function submitRun() {
   }
 }
 
+async function runSimulation() {
+  const status = document.getElementById("simulation-status");
+  const button = document.getElementById("run-simulation");
+  button.disabled = true;
+  status.textContent = "正在运行策略模拟...";
+  try {
+    const payload = {
+      strategy_id: document.getElementById("simulation-strategy").value,
+      seed_index: Number(document.getElementById("simulation-seed").value || 1),
+      output_name: document.getElementById("simulation-output").value,
+    };
+    const data = await getJson("/api/simulations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    dashboardState.resultId = data.result_id || "current";
+    dashboardState.cache[dashboardState.resultId] = data.dashboard;
+    await loadResultTabs(dashboardState.resultId);
+    setCurrentResultOption();
+    renderDashboard(data.dashboard);
+    status.textContent = `模拟完成，已保存到 ${data.result_path}。`;
+  } catch (error) {
+    status.textContent = `模拟失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 document.getElementById("load-sample").addEventListener("click", loadSamplePayload);
 document.getElementById("submit-run").addEventListener("click", submitRun);
+document.getElementById("run-simulation").addEventListener("click", runSimulation);
 attachTimelineZoomControls();
 attachAnimationControls();
+attachOrderHistoryToggle();
+attachDebugToggle();
 setTimelineZoom(1.4);
-loadResultOptions()
+loadStrategyOptions()
+  .then(() => loadResultTabs())
   .then(refresh)
   .then(loadSamplePayload)
   .catch((error) => {
