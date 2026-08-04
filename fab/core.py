@@ -234,9 +234,10 @@ def _average(values: list[float]) -> float:
 
 
 def _result_detail_path(path: Path) -> Path:
+    detail_dir = path.parent / "detail"
     if path.stem.endswith("_result"):
-        return path.with_name(f"{path.stem[:-7]}_detail{path.suffix}")
-    return path.with_name(f"{path.stem}_detail{path.suffix}")
+        return detail_dir / f"{path.stem[:-7]}_detail{path.suffix}"
+    return detail_dir / f"{path.stem}_detail{path.suffix}"
 
 
 def _dump_json(payload: dict[str, Any], path: Path) -> None:
@@ -497,6 +498,7 @@ def build_result_overview(result: dict[str, Any], detail_path: Path | None = Non
     for key, value in result.items():
         if (
             key.startswith("dbr_")
+            or key.startswith("rl_")
             and not key.endswith("_samples")
         ) or key in {"drum_process", "release_policy", "buffer_policy"}:
             overview[key] = deepcopy(value)
@@ -510,7 +512,7 @@ def save_result(result: dict[str, Any], path: Path) -> None:
     detail_path = _result_detail_path(path)
     overview = build_result_overview(
         result,
-        detail_path=Path(detail_path.name),
+        detail_path=detail_path.relative_to(path.parent),
     )
     _dump_json(
         {

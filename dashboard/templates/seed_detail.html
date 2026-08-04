@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Seed 详细模拟</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='fab_dashboard.css') }}?v=20260709-embedded">
+  </head>
+  <body class="seed-page">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">myFab scheduling dashboard</p>
+        <h1 id="seed-page-title">Seed 详细模拟</h1>
+      </div>
+      <div class="topbar-right">
+        <a class="back-link" href="/">返回策略平均成绩</a>
+      </div>
+    </header>
+
+    <main>
+      <section class="panel seed-detail-overview">
+        <div class="panel-heading">
+          <div class="panel-title">
+            <h2 id="seed-summary-title">Seed Summary</h2>
+            <span id="seed-summary-subtitle">加载中...</span>
+          </div>
+        </div>
+        <div id="seed-summary-grid" class="random-average"></div>
+        <div id="seed-set-grid" class="seed-set-grid"></div>
+      </section>
+
+      <section class="panel seed-detail-action">
+        <div class="panel-heading">
+          <div class="panel-title">
+            <h2>Detailed Trace</h2>
+            <span id="detail-status">尚未生成详细过程</span>
+          </div>
+        </div>
+        <button id="generate-detail" class="primary" type="button">展示详细过程</button>
+        <div id="detail-progress" class="seed-progress" hidden>
+          <div class="seed-progress-bar"><span></span></div>
+          <small>正在运行完整模拟...</small>
+        </div>
+        <p id="detail-complete" class="status" hidden></p>
+      </section>
+
+      <section id="embedded-detail-section" class="embedded-detail-section" hidden>
+        <div class="panel-heading">
+          <div class="panel-title">
+            <h2>Generated Detailed Dashboard</h2>
+            <span id="embedded-detail-meta">等待生成</span>
+          </div>
+        </div>
+
+        <section class="metric-grid" aria-label="算法对比指标">
+          <article class="metric-card">
+            <span>MCT Average</span>
+            <strong id="cycle-avg">0</strong>
+            <small id="cycle-detail">P50 0 · P90 0 · Max 0</small>
+          </article>
+          <article class="metric-card">
+            <span>Completion Ratio</span>
+            <strong id="completion-ratio">0%</strong>
+            <small id="movement-detail">Movement 0</small>
+          </article>
+          <article class="metric-card">
+            <span>Throughput</span>
+            <strong id="throughput-count">0</strong>
+            <small id="throughput-detail">Rate 0 / time</small>
+          </article>
+          <article class="metric-card">
+            <span>Average Fab WIP</span>
+            <strong id="average-wip">0</strong>
+            <small>Waiting list excluded</small>
+          </article>
+          <article class="metric-card">
+            <span>Released</span>
+            <strong id="released-count">0</strong>
+            <small id="released-detail">Rate 0 · Pool 0</small>
+          </article>
+          <article class="metric-card">
+            <span>Setup / Process</span>
+            <strong id="setup-ratio">0%</strong>
+            <small id="setup-detail">Setup 0 · Process 0</small>
+          </article>
+        </section>
+
+        <section class="diagnosis-grid" aria-label="流动诊断">
+          <div class="panel">
+            <div class="panel-heading">
+              <div class="panel-title">
+                <h2>Machine Utilization</h2>
+                <span id="utilization-summary">Avg 0 · Max 0</span>
+              </div>
+            </div>
+            <div id="utilization-bars" class="bar-list"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-heading">
+              <h2>Queue Length</h2>
+            </div>
+            <div id="queue-bars" class="bar-list"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-heading">
+              <h2>Wait By Process</h2>
+            </div>
+            <div id="wait-bars" class="bar-list"></div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-heading">
+              <h2>Bottleneck Signals</h2>
+            </div>
+            <div id="bottlenecks" class="rank-list"></div>
+          </div>
+        </section>
+
+        <section class="panel product-panel" aria-label="产品表现">
+          <div class="panel-heading">
+            <h2>Product Mix & Performance</h2>
+            <span>订单产品权重、正式窗口投入、完工和 MCT</span>
+          </div>
+          <div id="product-performance" class="product-performance"></div>
+        </section>
+
+        <details id="debug-section" class="debug-section">
+          <summary>Debug & Detailed Trace</summary>
+
+          <section class="panel animation-panel" aria-label="调度动画">
+            <div class="panel-heading">
+              <div class="panel-title">
+                <h2>Schedule Animation</h2>
+                <span id="animation-clock">time 0</span>
+              </div>
+              <div class="animation-tools" aria-label="animation controls">
+                <button id="animation-toggle" type="button" title="Play or pause">▶</button>
+                <button id="animation-back" type="button" title="Step backward">‹</button>
+                <button id="animation-forward" type="button" title="Step forward">›</button>
+                <label class="animation-slider" title="Animation time">
+                  <span>Time</span>
+                  <input id="animation-range" type="range" min="0" max="1" step="1" value="0">
+                </label>
+                <label class="animation-speed" title="Playback speed">
+                  <span>Speed</span>
+                  <select id="animation-speed">
+                    <option value="0.5">0.5x</option>
+                    <option value="1" selected>1x</option>
+                    <option value="2">2x</option>
+                    <option value="4">4x</option>
+                  </select>
+                </label>
+              </div>
+            </div>
+            <div class="animation-grid">
+              <div id="animation-machines" class="animation-machines"></div>
+              <div class="buffer-panel waiting-panel">
+                <div class="buffer-header">
+                  <div>
+                    <span>Order Queue</span>
+                    <strong id="waiting-size">0 / 0</strong>
+                  </div>
+                  <div>
+                    <span>Head Order</span>
+                    <strong id="waiting-head">-</strong>
+                  </div>
+                  <div>
+                    <span>Generated Lots</span>
+                    <strong id="generated-count">0</strong>
+                  </div>
+                </div>
+                <div id="waiting-list" class="waiting-list"></div>
+                <small class="waiting-note">按订单分组显示尚未投入 fab 的 lot；队首订单优先释放。</small>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel order-panel is-collapsed" aria-label="订单到达历史">
+            <div class="panel-heading">
+              <div class="panel-title">
+                <h2>Order Arrival History</h2>
+                <span id="order-history-summary">0 orders</span>
+              </div>
+              <button id="order-history-toggle" type="button" aria-expanded="false" aria-controls="order-history">展开</button>
+            </div>
+            <div id="order-history" class="order-history"></div>
+          </section>
+
+          <section class="dashboard-grid">
+            <div class="panel wide">
+              <div class="panel-heading">
+                <div class="panel-title">
+                  <h2>Machine Timeline</h2>
+                  <span id="horizon">horizon 0</span>
+                </div>
+                <div class="timeline-tools" aria-label="timeline zoom controls">
+                  <button id="timeline-fullscreen" type="button" title="Fullscreen timeline">⛶</button>
+                  <button id="timeline-zoom-out" type="button" title="Zoom out">-</button>
+                  <button id="timeline-zoom-reset" type="button" title="Reset zoom">1x</button>
+                  <button id="timeline-zoom-fit" type="button" title="Fit to screen">Fit</button>
+                  <button id="timeline-zoom-in" type="button" title="Zoom in">+</button>
+                  <label class="timeline-slider" title="Timeline zoom">
+                    <span>Zoom</span>
+                    <input id="timeline-zoom-range" type="range" min="0.6" max="4" step="0.1" value="1">
+                  </label>
+                  <span id="timeline-zoom-value" class="timeline-zoom-value">1.0x</span>
+                </div>
+              </div>
+              <div id="timeline" class="timeline"></div>
+            </div>
+          </section>
+        </details>
+      </section>
+    </main>
+
+    <script>
+      window.__fabDashboardManual = true;
+      window.__seedDetail = {
+        strategyId: {{ strategy_id | tojson }},
+        seedIndex: {{ seed_index | tojson }}
+      };
+    </script>
+    <script src="{{ url_for('static', filename='fab_dashboard.js') }}?v=20260709-direct-detail"></script>
+    <script src="{{ url_for('static', filename='seed_detail.js') }}?v=20260709-direct-detail"></script>
+  </body>
+</html>

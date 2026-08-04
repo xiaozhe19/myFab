@@ -9,6 +9,8 @@ const dashboardState = {
   resultId: "current",
   results: [],
   cache: {},
+  strategySummaries: [],
+  expandedStrategyId: null,
 };
 
 const animationState = {
@@ -40,12 +42,16 @@ function pct(value) {
 }
 
 function setText(id, value) {
-  document.getElementById(id).textContent = value;
+  const element = document.getElementById(id);
+  if (element) element.textContent = value;
 }
 
 function renderDashboard(data) {
   window.__fabDashboardData = data;
+  document.body.classList.toggle("summary-mode", Boolean(data.random_run));
+  document.body.classList.toggle("detail-mode", !data.random_run);
   renderMetricCards(data);
+  renderRandomRunPanel(data);
   renderSystemStructure(data);
   renderProductPerformance(data);
   renderOrderHistory(data);
@@ -54,6 +60,243 @@ function renderDashboard(data) {
   renderWaitByProcess(data);
   renderBottlenecks(data);
   renderDebugPanels(data);
+}
+
+function metricValue(metrics, key) {
+  return metrics && Object.prototype.hasOwnProperty.call(metrics, key) ? metrics[key] : 0;
+}
+
+function renderRandomRunPanel(data) {
+  const section = document.getElementById("random-run-section");
+  const averageRoot = document.getElementById("random-run-average");
+  const runsRoot = document.getElementById("random-seed-runs");
+  if (!section || !averageRoot || !runsRoot) return;
+
+  const randomRun = data.random_run;
+  section.hidden = !randomRun;
+  averageRoot.innerHTML = "";
+  runsRoot.innerHTML = "";
+  if (!randomRun) return;
+
+  const average = randomRun.average || {};
+  setText("random-run-summary", `${randomRun.seed_count || 0} seeds · ${randomRun.strategy || "strategy"}`);
+  [
+    ["Throughput", "throughput"],
+    ["MCT", "mct_average"],
+    ["Avg WIP", "average_fab_wip"],
+    ["Moves", "movements"],
+    ["Setup Time", "total_setup_time"],
+    ["Downtime", "total_downtime"],
+  ].forEach(([label, key]) => {
+    const item = document.createElement("div");
+    item.innerHTML = `<span>${label}</span><strong>${fmt(metricValue(average, key), key.includes("utilization") ? 4 : 2)}</strong>`;
+    averageRoot.appendChild(item);
+  });
+
+  (randomRun.runs || []).forEach((run) => {
+    const metrics = run.metrics || {};
+    const card = document.createElement("article");
+    card.className = "seed-run-card";
+    const seedIndex = Number(run.seed_index || 0);
+    card.innerHTML = `
+      <div class="seed-run-head">
+        <strong>Seed ${seedIndex}</strong>
+        <span>${fmt(metricValue(metrics, "throughput"), 0)} done</span>
+      </div>
+      <div class="seed-run-metrics">
+        <span>MCT <strong>${fmt(metricValue(metrics, "mct_average"))}</strong></span>
+        <span>WIP <strong>${fmt(metricValue(metrics, "average_fab_wip"))}</strong></span>
+        <span>Moves <strong>${fmt(metricValue(metrics, "movements"), 0)}</strong></span>
+        <span>Setup <strong>${fmt(metricValue(metrics, "setup_count"), 0)}</strong></span>
+      </div>
+      <button type="button" class="seed-detail-button" data-seed-index="${seedIndex}">查看详细过程</button>
+    `;
+    card.querySelector(".seed-detail-button").addEventListener("click", () => runSeedDetail(seedIndex));
+    runsRoot.appendChild(card);
+  });
+}
+
+function averageMetricBlock(label, value, digits = 2) {
+  return `<div><span>${label}</span><strong>${fmt(value, digits)}</strong></div>`;
+}
+
+function renderStrategySummaries(payload) {
+  const root = document.getElementById("strategy-average-grid");
+  const status = document.getElementById("strategy-summary-status");
+  if (!root || !status) return;
+  dashboardState.strategySummaries = payload.strategies || [];
+  root.innerHTML = "";
+  status.textContent = `${dashboardState.strategySummaries.length} strategies · click a card to expand seeds`;
+  setText("strategy", "All strategies");
+  setText("run-id", "random seed averages");
+  document.body.classList.add("summary-mode");
+
+  dashboardState.strategySummaries.forEach((strategy) => {
+    const average = strategy.average || {};
+    const generated = Boolean(strategy.generated);
+    const card = document.createElement("article");
+    card.className = "strategy-average-card";
+    if (!generated) card.classList.add("is-missing");
+    card.dataset.strategyId = strategy.strategy_id;
+    card.innerHTML = `
+      <button type="button" class="strategy-average-head" aria-expanded="false" ${generated ? "" : "disabled"}>
+        <div>
+          <strong>${strategy.label}</strong>
+          <span>${generated ? `${strategy.seed_count || 0} seeds` : "未生成平均成绩"}</span>
+        </div>
+        <i>${generated ? "展开" : "等待生成"}</i>
+      </button>
+      ${generated ? `
+        <div class="strategy-average-metrics">
+          ${averageMetricBlock("Throughput", metricValue(average, "throughput"))}
+          ${averageMetricBlock("MCT", metricValue(average, "mct_average"))}
+          ${averageMetricBlock("Avg WIP", metricValue(average, "average_fab_wip"))}
+          ${averageMetricBlock("Moves", metricValue(average, "movements"), 0)}
+          ${averageMetricBlock("Setup", metricValue(average, "total_setup_time"))}
+          ${averageMetricBlock("Util", metricValue(average, "machine_utilization_average"), 4)}
+        </div>
+      ` : `
+        <p class="missing-summary-note">这个策略还没有 random seed summary。</p>
+        <button type="button" class="build-summary-button">生成平均成绩</button>
+        <div class="seed-progress summary-progress" hidden>
+          <div class="seed-progress-bar"><span></span></div>
+          <small>正在跑该策略的全部 seed...</small>
+        </div>
+      `}
+    `;
+    const buildButton = card.querySelector(".build-summary-button");
+    if (buildButton) {
+      buildButton.addEventListener("click", () => buildStrategySummary(strategy.strategy_id, card));
+    }
+    const head = card.querySelector(".strategy-average-head");
+    head.addEventListener("click", () => {
+      dashboardState.expandedStrategyId = dashboardState.expandedStrategyId === strategy.strategy_id
+        ? null
+        : strategy.strategy_id;
+      renderStrategySummaries({ strategies: dashboardState.strategySummaries });
+    });
+    if (dashboardState.expandedStrategyId === strategy.strategy_id) {
+      card.classList.add("is-expanded");
+      head.setAttribute("aria-expanded", "true");
+      head.querySelector("i").textContent = "收起";
+    }
+    root.appendChild(card);
+  });
+  renderStrategySeedDetailPanel();
+}
+
+function renderStrategySeedDetailPanel() {
+  const panel = document.getElementById("strategy-seed-detail-panel");
+  const title = document.getElementById("strategy-seed-detail-title");
+  const summary = document.getElementById("strategy-seed-detail-summary");
+  const root = document.getElementById("strategy-seed-detail-grid");
+  if (!panel || !root) return;
+  const strategy = dashboardState.strategySummaries.find((item) => item.strategy_id === dashboardState.expandedStrategyId);
+  if (!strategy) {
+    panel.hidden = true;
+    root.innerHTML = "";
+    return;
+  }
+  panel.hidden = false;
+  title.textContent = `${strategy.label} Seed Results`;
+  summary.textContent = `${strategy.seed_count || 0} seeds`;
+  renderStrategySeeds(root, strategy);
+}
+
+async function buildStrategySummary(strategyId, card) {
+  const status = document.getElementById("simulation-status");
+  const button = card.querySelector(".build-summary-button");
+  const progress = card.querySelector(".summary-progress");
+  const bar = card.querySelector(".seed-progress-bar span");
+  const progressText = progress.querySelector("small");
+  button.disabled = true;
+  progress.hidden = false;
+  bar.style.width = "0%";
+  progressText.textContent = "正在启动后台任务...";
+  status.textContent = `正在生成 ${strategyId} 的全部 seed 平均成绩...`;
+  try {
+    const started = await getJson(`/api/strategies/${encodeURIComponent(strategyId)}/random-summary-job`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const jobId = started.job_id;
+    while (true) {
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const payload = await getJson(`/api/random-summary-jobs/${encodeURIComponent(jobId)}`);
+      const job = payload.job || {};
+      const seedCount = Number(job.seed_count || 0);
+      const completed = Number(job.completed || 0);
+      const currentSeed = Number(job.current_seed || 0);
+      const activeSeeds = Array.isArray(job.active_seeds) ? job.active_seeds : [];
+      const ratio = seedCount > 0 ? Math.min(completed / seedCount, 1) : 0;
+      bar.style.width = `${Math.round(ratio * 100)}%`;
+
+      if (job.state === "running" || job.state === "submitted") {
+        const activeText = activeSeeds.length ? activeSeeds.join(", ") : currentSeed || "-";
+        progressText.textContent = `已完成 ${completed} / ${seedCount}，运行中 seeds: ${activeText}`;
+        status.textContent = `${strategyId}: 已完成 ${completed} / ${seedCount}，运行中 seeds: ${activeText}`;
+      } else if (job.state === "completed_seed") {
+        const activeText = activeSeeds.length ? `，运行中 seeds: ${activeSeeds.join(", ")}` : "";
+        progressText.textContent = `已完成 ${completed} / ${seedCount} 个 seed${activeText}`;
+        status.textContent = `${strategyId}: 已完成 ${completed} / ${seedCount} 个 seed${activeText}`;
+      } else if (job.state === "done") {
+        bar.style.width = "100%";
+        progressText.textContent = `已完成 ${completed} / ${seedCount} 个 seed`;
+        status.textContent = `${strategyId} 平均成绩已生成。`;
+        await loadStrategySummaries();
+        break;
+      } else if (job.state === "error") {
+        throw new Error(job.error || "后台任务失败");
+      } else {
+        progressText.textContent = "正在等待任务开始...";
+      }
+    }
+  } catch (error) {
+    button.disabled = false;
+    progress.hidden = true;
+    status.textContent = `${strategyId} 平均成绩生成失败：${error.message}`;
+  }
+}
+
+function renderStrategySeeds(root, strategy) {
+  root.innerHTML = "";
+  (strategy.runs || []).forEach((run) => {
+    const metrics = run.metrics || {};
+    const seedIndex = Number(run.seed_index || 0);
+    const item = document.createElement("article");
+    item.className = "strategy-seed-card";
+    item.innerHTML = `
+      <div class="seed-run-head">
+        <strong>Seed ${seedIndex}</strong>
+        <span>${fmt(metricValue(metrics, "throughput"), 0)} done</span>
+      </div>
+      <div class="seed-run-metrics">
+        <span>MCT <strong>${fmt(metricValue(metrics, "mct_average"))}</strong></span>
+        <span>WIP <strong>${fmt(metricValue(metrics, "average_fab_wip"))}</strong></span>
+        <span>Moves <strong>${fmt(metricValue(metrics, "movements"), 0)}</strong></span>
+        <span>Setup <strong>${fmt(metricValue(metrics, "setup_count"), 0)}</strong></span>
+      </div>
+      <button type="button" class="seed-detail-button">模拟详细过程</button>
+      <div class="seed-progress" hidden>
+        <div class="seed-progress-bar"><span></span></div>
+        <small>正在运行该 seed 的完整模拟...</small>
+      </div>
+    `;
+    item.querySelector(".seed-detail-button").addEventListener("click", () => {
+      window.location.href = `/seed-detail/${encodeURIComponent(strategy.strategy_id)}/${seedIndex}`;
+    });
+    root.appendChild(item);
+  });
+}
+
+async function loadStrategySummaries() {
+  const status = document.getElementById("strategy-summary-status");
+  if (status) {
+    status.textContent = "正在准备所有策略平均成绩，缺失的 summary 会自动补跑...";
+  }
+  const payload = await getJson("/api/strategy-random-summaries");
+  renderStrategySummaries(payload);
 }
 
 function renderDebugPanels(data) {
@@ -958,18 +1201,156 @@ async function runSimulation() {
   }
 }
 
-document.getElementById("load-sample").addEventListener("click", loadSamplePayload);
-document.getElementById("submit-run").addEventListener("click", submitRun);
-document.getElementById("run-simulation").addEventListener("click", runSimulation);
-attachTimelineZoomControls();
-attachAnimationControls();
-attachOrderHistoryToggle();
-attachDebugToggle();
-setTimelineZoom(1.4);
-loadStrategyOptions()
-  .then(() => loadResultTabs())
-  .then(refresh)
-  .then(loadSamplePayload)
-  .catch((error) => {
-    document.getElementById("submit-status").textContent = `加载失败：${error.message}`;
+async function runRandomRun() {
+  const status = document.getElementById("simulation-status");
+  const button = document.getElementById("run-random-run");
+  button.disabled = true;
+  status.textContent = "正在运行全部种子评测...";
+  try {
+    const strategyId = document.getElementById("simulation-strategy").value;
+    const payload = {
+      strategy_id: strategyId,
+      output_name: `${strategyId}_random_run_result.json`,
+    };
+    const data = await getJson("/api/random-runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    dashboardState.resultId = data.result_id || "current";
+    dashboardState.cache[dashboardState.resultId] = data.dashboard;
+    await loadResultTabs(dashboardState.resultId);
+    setCurrentResultOption();
+    renderDashboard(data.dashboard);
+    status.textContent = `全部种子评测完成，已保存到 ${data.result_path}。`;
+  } catch (error) {
+    status.textContent = `全部种子评测失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function runSeedDetail(seedIndex) {
+  const status = document.getElementById("simulation-status");
+  const resultId = dashboardState.resultId;
+  if (!resultId || resultId === "current") {
+    status.textContent = "请先选择一个已保存的 random-run summary。";
+    return;
+  }
+  status.textContent = `正在运行 seed ${seedIndex} 的详细模拟...`;
+  document.querySelectorAll(".seed-detail-button").forEach((button) => {
+    button.disabled = true;
   });
+  try {
+    const data = await getJson(`/api/random-runs/${encodeURIComponent(resultId)}/seeds/${seedIndex}/detail`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    dashboardState.resultId = data.result_id || "current";
+    dashboardState.cache[dashboardState.resultId] = data.dashboard;
+    await loadResultTabs(dashboardState.resultId);
+    setCurrentResultOption();
+    renderDashboard(data.dashboard);
+    const debug = document.getElementById("debug-section");
+    if (debug) debug.open = true;
+    status.textContent = `Seed ${seedIndex} 详细过程已生成，保存到 ${data.result_path}。`;
+  } catch (error) {
+    status.textContent = `Seed ${seedIndex} 详细过程生成失败：${error.message}`;
+  } finally {
+    document.querySelectorAll(".seed-detail-button").forEach((button) => {
+      button.disabled = false;
+    });
+  }
+}
+
+async function runStrategySeedDetail(strategyId, seedIndex, card) {
+  const status = document.getElementById("simulation-status");
+  const button = card.querySelector(".seed-detail-button");
+  const progress = card.querySelector(".seed-progress");
+  const bar = card.querySelector(".seed-progress-bar span");
+  let progressValue = 8;
+  let timer = null;
+  button.disabled = true;
+  progress.hidden = false;
+  bar.style.width = `${progressValue}%`;
+  status.textContent = `正在运行 ${strategyId} seed ${seedIndex} 的详细模拟...`;
+  timer = setInterval(() => {
+    progressValue = Math.min(progressValue + Math.max(1, (92 - progressValue) * 0.08), 92);
+    bar.style.width = `${progressValue}%`;
+  }, 400);
+
+  try {
+    const data = await getJson(`/api/strategies/${encodeURIComponent(strategyId)}/seeds/${seedIndex}/detail`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    clearInterval(timer);
+    bar.style.width = "100%";
+    document.body.classList.remove("summary-mode");
+    dashboardState.resultId = data.result_id || "current";
+    dashboardState.cache[dashboardState.resultId] = data.dashboard;
+    renderDashboard(data.dashboard);
+    const debug = document.getElementById("debug-section");
+    if (debug) debug.open = true;
+    status.textContent = `Seed ${seedIndex} 详细过程已生成，保存到 ${data.result_path}。`;
+  } catch (error) {
+    clearInterval(timer);
+    status.textContent = `Seed ${seedIndex} 详细过程生成失败：${error.message}`;
+    progress.hidden = true;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function attachFabDashboardControls() {
+  if (window.__fabDashboardControlsAttached) return;
+  window.__fabDashboardControlsAttached = true;
+  const loadSampleButton = document.getElementById("load-sample");
+  const submitRunButton = document.getElementById("submit-run");
+  if (loadSampleButton) loadSampleButton.addEventListener("click", loadSamplePayload);
+  if (submitRunButton) submitRunButton.addEventListener("click", submitRun);
+  attachTimelineZoomControls();
+  attachAnimationControls();
+  attachOrderHistoryToggle();
+  attachDebugToggle();
+  setTimelineZoom(1.4);
+}
+
+function showFabDashboardData(data) {
+  attachFabDashboardControls();
+  renderDashboard(data);
+  const debug = document.getElementById("debug-section");
+  if (debug) debug.open = true;
+}
+
+window.showFabDashboardData = showFabDashboardData;
+
+function initializeFabDashboardPage() {
+  attachFabDashboardControls();
+  const initialResultId = window.__initialResultId || "";
+  if (initialResultId) {
+    dashboardState.resultId = initialResultId;
+    document.body.classList.remove("summary-mode");
+    refresh()
+      .then(loadSamplePayload)
+      .catch((error) => {
+        const status = document.getElementById("submit-status");
+        if (status) status.textContent = `加载失败：${error.message}`;
+      });
+  } else {
+    loadStrategySummaries()
+      .then(loadSamplePayload)
+      .catch((error) => {
+        const submitStatus = document.getElementById("submit-status");
+        if (submitStatus) submitStatus.textContent = `加载失败：${error.message}`;
+        const status = document.getElementById("strategy-summary-status");
+        if (status) status.textContent = `加载失败：${error.message}`;
+      });
+  }
+}
+
+if (!window.__fabDashboardManual) {
+  initializeFabDashboardPage();
+}

@@ -87,7 +87,7 @@ def steps_until_drum(wafer: WaferState, drum_process: str = DRUM_PROCESS) -> int
     """
     判断 wafer 从当前 step 开始，还要几步才会到 Drum。
 
-    返回值解释：
+    返回值：
     - 0：当前就在 Drum 前面
     - 1：做完当前这一步，下一步就是 Drum
     - None：后续路线不再经过 Drum
@@ -157,9 +157,6 @@ def select_dbr_job(
     """
     DBR v1 的派工函数。
 
-    现在整个文件里最重要的就是这个函数。
-    通用仿真引擎已经帮你处理了机器、setup、downtime、时间推进和结果保存；
-    这里你只需要决定“当前这台机器从候选 wafer 中选谁”。
     """
 
     reserved_wafer_ids = reserved_wafer_ids or set()

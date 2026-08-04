@@ -4,12 +4,15 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import re
 from statistics import mean, pvariance
+import threading
 from typing import Any
+from uuid import uuid4
 
 from flask import Flask, jsonify, render_template, request
 import json
 from pathlib import Path
 
+from fab.random_run import build_random_run_result, save_random_run_result
 from fab.run_sim import run_simulation_from_files, save_result
 from fab.settings import build_factory_config
 
@@ -32,6 +35,7 @@ STRATEGIES: list[dict[str, Any]] = [
         "id": "fifo",
         "label": "FIFO",
         "spec": "strategy.fifo:FIFOStrategy",
+        "spec_aliases": ["FIFO:FIFOStrategy"],
         "params_path": None,
         "output": "fifo_result.json",
     },
@@ -39,6 +43,7 @@ STRATEGIES: list[dict[str, Any]] = [
         "id": "batching_fifo",
         "label": "Batching FIFO",
         "spec": "strategy.batching_fifo:BatchingFIFOStrategy",
+        "spec_aliases": ["BATCHING_FIFO:BatchingFIFOStrategy"],
         "params_path": None,
         "output": "batching_fifo_result.json",
     },
@@ -46,6 +51,7 @@ STRATEGIES: list[dict[str, Any]] = [
         "id": "dbr_v1",
         "label": "DBR v1",
         "spec": "strategy.dbr_v1:DBRV1Strategy",
+        "spec_aliases": ["DBR_v1:DBRV1Strategy"],
         "params_path": None,
         "output": "dbr_v1_result.json",
     },
@@ -53,10 +59,40 @@ STRATEGIES: list[dict[str, Any]] = [
         "id": "dbr_v2",
         "label": "Dynamic DBR v2",
         "spec": "strategy.dbr_v2:DynamicDBR",
+        "spec_aliases": ["DBR_v2:DynamicDBR"],
         "params_path": STRATEGY_CONFIG_DIR / "DBR_v2_config.json",
         "output": "dbr_v2_result.json",
     },
+    {
+        "id": "rl_v1",
+        "label": "RL Release + DBR v2 Dispatch",
+        "spec": "strategy.rl_v1:RLDBRMixStrategy",
+        "spec_aliases": ["RL_v1:RLDBRMixStrategy"],
+        "params_path": STRATEGY_CONFIG_DIR / "DBR_v2_config.json",
+        "output": "rl_v1_result.json",
+    },
 ]
+
+
+def _random_summary_output(strategy: dict[str, Any]) -> Path:
+    return RESULT_DIR / f"{strategy['id']}_random_run_result.json"
+
+
+def _load_random_summary(strategy: dict[str, Any]) -> dict[str, Any] | None:
+    preferred = _load_json_file(_random_summary_output(strategy))
+    if preferred and preferred.get("result_kind") == "random_run_summary":
+        return preferred
+
+    accepted_specs = {strategy["spec"], *strategy.get("spec_aliases", [])}
+    for path in RESULT_DIR.glob("*random_run_result.json"):
+        payload = _load_json_file(path)
+        if (
+            payload
+            and payload.get("result_kind") == "random_run_summary"
+            and payload.get("strategy_spec") in accepted_specs
+        ):
+            return payload
+    return None
 
 
 def _now_iso() -> str:
@@ -223,6 +259,8 @@ def _load_initial_run() -> dict[str, Any]:
 
 CURRENT_RUN = _load_initial_run()
 DASHBOARD_CACHE: dict[str, tuple[str, dict[str, Any]]] = {}
+RANDOM_SUMMARY_JOBS: dict[str, dict[str, Any]] = {}
+RANDOM_SUMMARY_JOBS_LOCK = threading.Lock()
 
 
 def _normalize_run(payload: dict[str, Any]) -> dict[str, Any]:
@@ -275,8 +313,123 @@ def _load_run_by_id(result_id: str | None) -> dict[str, Any]:
             continue
         payload = _load_json_file(PROJECT_ROOT / str(entry["path"]))
         if payload:
+            detail_path = payload.get("detail_path")
+            if detail_path:
+                detail_payload = _load_json_file((PROJECT_ROOT / str(entry["path"])).parent / str(detail_path))
+                if detail_payload:
+                    return _normalize_run(detail_payload)
             return _normalize_run(payload)
     raise KeyError(result_id)
+
+
+def _result_path_by_id(result_id: str) -> Path:
+    for entry in _discover_result_files():
+        if entry["id"] == result_id and entry["source"] == "file":
+            return PROJECT_ROOT / str(entry["path"])
+    raise KeyError(result_id)
+
+
+def _load_or_build_random_summary(strategy: dict[str, Any]) -> dict[str, Any]:
+    payload = _load_random_summary(strategy)
+    if payload:
+        return payload
+
+    output_path = _random_summary_output(strategy)
+    result = build_random_run_result(
+        strategy_spec=strategy["spec"],
+        strategy_params_path=strategy["params_path"],
+        factory_path=FAB_CONFIG_DIR / "factory_config.json",
+        product_path=FAB_CONFIG_DIR / "product_config.json",
+        machine_path=MACHINE_CONFIG_DIR / "machine_config.json",
+        orders_path=ORDER_CONFIG_DIR / "order_config.json",
+        simulation_path=FAB_CONFIG_DIR / "simulation_config.json",
+        seeds_path=FAB_CONFIG_DIR / "simulation_seeds.json",
+    )
+    save_random_run_result(result, output_path)
+    return result
+
+
+def _strategy_summary_card(strategy: dict[str, Any]) -> dict[str, Any]:
+    summary = _load_random_summary(strategy)
+    return {
+        "strategy_id": strategy["id"],
+        "label": strategy["label"],
+        "result_id": _random_summary_output(strategy).stem.replace("_result", ""),
+        "result_path": str(_random_summary_output(strategy).relative_to(PROJECT_ROOT)),
+        "generated": bool(summary),
+        "generated_at": summary.get("generated_at") if summary else None,
+        "seed_count": summary.get("seed_count", 0) if summary else 0,
+        "average": summary.get("average", {}) if summary else {},
+        "runs": summary.get("runs", []) if summary else [],
+    }
+
+
+def _set_random_job(job_id: str, **updates: Any) -> None:
+    with RANDOM_SUMMARY_JOBS_LOCK:
+        job = RANDOM_SUMMARY_JOBS.setdefault(job_id, {})
+        job.update(updates)
+        job["updated_at"] = _now_iso()
+
+
+def _get_random_job(job_id: str) -> dict[str, Any] | None:
+    with RANDOM_SUMMARY_JOBS_LOCK:
+        job = RANDOM_SUMMARY_JOBS.get(job_id)
+        return deepcopy(job) if job else None
+
+
+def _run_random_summary_job(job_id: str, strategy: dict[str, Any]) -> None:
+    output_path = _random_summary_output(strategy)
+
+    def progress(update: dict[str, Any]) -> None:
+        _set_random_job(
+            job_id,
+            state=update.get("status", "running"),
+            current_seed=update.get("seed_index"),
+            seed_count=update.get("seed_count"),
+            completed=update.get("completed", 0),
+            active_seeds=update.get("active_seeds", []),
+            max_workers=update.get("max_workers"),
+            seed_set=update.get("seed_set"),
+        )
+
+    try:
+        _set_random_job(
+            job_id,
+            state="queued",
+            strategy_id=strategy["id"],
+            label=strategy["label"],
+            current_seed=None,
+            seed_count=0,
+            completed=0,
+            active_seeds=[],
+            max_workers=None,
+            result_path=None,
+            error=None,
+        )
+        result = build_random_run_result(
+            strategy_spec=strategy["spec"],
+            strategy_params_path=strategy["params_path"],
+            factory_path=FAB_CONFIG_DIR / "factory_config.json",
+            product_path=FAB_CONFIG_DIR / "product_config.json",
+            machine_path=MACHINE_CONFIG_DIR / "machine_config.json",
+            orders_path=ORDER_CONFIG_DIR / "order_config.json",
+            simulation_path=FAB_CONFIG_DIR / "simulation_config.json",
+            seeds_path=FAB_CONFIG_DIR / "simulation_seeds.json",
+            progress_callback=progress,
+        )
+        save_random_run_result(result, output_path)
+        _set_random_job(
+            job_id,
+            state="done",
+            current_seed=None,
+            seed_count=result.get("seed_count", 0),
+            completed=result.get("seed_count", 0),
+            active_seeds=[],
+            result_path=str(output_path.relative_to(PROJECT_ROOT)),
+            strategy=_strategy_summary_card(strategy),
+        )
+    except Exception as error:
+        _set_random_job(job_id, state="error", error=str(error))
 
 
 def _dashboard_cache_token(result_id: str | None) -> str:
@@ -296,9 +449,166 @@ def _compute_dashboard_by_id(result_id: str | None) -> dict[str, Any]:
     if cached and cached[0] == token:
         return cached[1]
 
-    dashboard = compute_dashboard(_load_run_by_id(result_id))
+    payload = _load_run_by_id(result_id)
+    dashboard = (
+        compute_random_run_dashboard(payload)
+        if payload.get("result_kind") == "random_run_summary"
+        else compute_dashboard(payload)
+    )
     DASHBOARD_CACHE[cache_id] = (token, dashboard)
     return dashboard
+
+
+def compute_random_run_dashboard(summary: dict[str, Any]) -> dict[str, Any]:
+    summary = deepcopy(summary)
+    factory_config = build_factory_config(
+        _load_json_file(FAB_CONFIG_DIR / "factory_config.json") or {},
+        _load_json_file(FAB_CONFIG_DIR / "product_config.json") or {},
+        _load_json_file(MACHINE_CONFIG_DIR / "machine_config.json") or {},
+    )
+    order_config = _load_json_file(ORDER_CONFIG_DIR / "order_config.json") or {}
+    simulation_config = _load_json_file(FAB_CONFIG_DIR / "simulation_config.json") or {}
+    average = summary.get("average", {})
+    runs = summary.get("runs", [])
+    horizon = _num(average.get("measurement_horizon"))
+    released = _num(average.get("released"))
+    throughput = _num(average.get("throughput"))
+    movements = _num(average.get("movements"))
+    process_time = _num(average.get("total_process_time"))
+    setup_time = _num(average.get("total_setup_time"))
+    products = factory_config.get("products", [])
+    product_mix = order_config.get("product_mix", {})
+    product_performance = []
+    for product in products:
+        product_id = product.get("id")
+        product_performance.append(
+            {
+                "id": product_id,
+                "name": product.get("name", product_id),
+                "mix_weight": _num(product_mix.get(product_id), 1),
+                "target_share": 0,
+                "released": 0,
+                "release_share": 0,
+                "completed": 0,
+                "mct_average": 0,
+            }
+        )
+    total_weight = sum(item["mix_weight"] for item in product_performance)
+    if total_weight > 0:
+        for item in product_performance:
+            item["target_share"] = item["mix_weight"] / total_weight
+
+    return {
+        "run": {
+            "run_id": summary.get("strategy_spec", summary.get("strategy", "random-run")),
+            "strategy": f"{summary.get('strategy', 'Strategy')} average",
+            "time_unit": simulation_config.get("time_unit", "minute"),
+            "generated_at": summary.get("generated_at", _now_iso()),
+            "horizon": round(horizon, 3),
+            "window_start": _num(average.get("measurement_start_time")),
+            "window_end": _num(average.get("measurement_end_time")),
+            "warmup_time": _num(average.get("warmup_time")),
+            "wafer_count": 0,
+            "completed_count": round(throughput, 3),
+            "factory_id": factory_config.get("factory_id", "-"),
+        },
+        "structure": {
+            "factory": {
+                "machines": len(factory_config.get("machines", [])),
+                "stations": len({machine.get("type") for machine in factory_config.get("machines", [])}),
+                "products": len(products),
+            },
+            "orders": {
+                "arrival_type": order_config.get("arrival", {}).get("type", "unknown"),
+                "interval": _num(order_config.get("arrival", {}).get("interval")),
+                "lots_per_order": int(_num(order_config.get("lots_per_order"))),
+                "orders_generated": 0,
+                "lots_generated": 0,
+                "final_backlog": 0,
+                "capacity": int(_num(order_config.get("waiting_list", {}).get("max_size"))),
+            },
+            "policy": {
+                "release_interval": 0,
+            },
+        },
+        "business": {
+            "mct": {
+                "average": _num(average.get("mct_average")),
+                "p50": 0,
+                "p90": 0,
+                "max": 0,
+            },
+            "movement": {
+                "count": round(movements, 3),
+                "rate": round(movements / horizon, 4) if horizon > 0 else 0.0,
+            },
+            "throughput": {
+                "completed": round(throughput, 3),
+                "rate": round(throughput / horizon, 4) if horizon > 0 else 0.0,
+                "completion_ratio": round(throughput / released, 4) if released > 0 else 0.0,
+            },
+            "wip": {
+                "average": _num(average.get("average_fab_wip")),
+            },
+            "release": {
+                "count": round(released, 3),
+                "rate": round(released / horizon, 4) if horizon > 0 else 0.0,
+                "waiting_capacity": int(_num(order_config.get("waiting_list", {}).get("max_size"))),
+                "waiting_backlog": 0,
+            },
+            "efficiency": {
+                "process_time": round(process_time, 3),
+                "setup_time": round(setup_time, 3),
+                "setup_to_process_ratio": (
+                    round(setup_time / process_time, 4)
+                    if process_time > 0
+                    else 0.0
+                ),
+            },
+            "products": product_performance,
+        },
+        "health": {
+            "machine_utilization": {
+                "average": round(_num(average.get("machine_utilization_average")), 4),
+                "variance": 0,
+                "min": round(_num(average.get("machine_utilization_min")), 4),
+                "max": round(_num(average.get("machine_utilization_max")), 4),
+                "machines": [],
+            },
+            "queue_length": [],
+            "wait_by_process": [],
+            "bottlenecks": [],
+        },
+        "timeline": {
+            "machines": [
+                {
+                    "id": machine.get("id"),
+                    "name": machine.get("name", machine.get("id")),
+                    "type": machine.get("type", "Unknown"),
+                    "operations": [],
+                }
+                for machine in factory_config.get("machines", [])
+            ]
+        },
+        "random_run": {
+            "strategy": summary.get("strategy"),
+            "strategy_spec": summary.get("strategy_spec"),
+            "strategy_params_path": summary.get("strategy_params_path"),
+            "seed_count": summary.get("seed_count", len(runs)),
+            "average": average,
+            "runs": runs,
+        },
+        "raw": {
+            "products": products,
+            "wafers": [],
+            "operations": [],
+            "machine_events": [],
+            "queue_samples": [],
+            "order_events": [],
+            "release_events": [],
+            "waiting_list": {},
+        },
+    }
 
 
 def compute_dashboard(run: dict[str, Any]) -> dict[str, Any]:
@@ -755,6 +1065,24 @@ def dashboard_page():
     return render_template("fab_dashboard.html")
 
 
+@app.get("/details/<result_id>")
+def detail_dashboard_page(result_id: str):
+    return render_template(
+        "fab_dashboard.html",
+        initial_result_id=result_id,
+        embedded=bool(request.args.get("embedded")),
+    )
+
+
+@app.get("/seed-detail/<strategy_id>/<int:seed_index>")
+def seed_detail_page(strategy_id: str, seed_index: int):
+    return render_template(
+        "seed_detail.html",
+        strategy_id=strategy_id,
+        seed_index=seed_index,
+    )
+
+
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "fab-dashboard", "time": _now_iso()})
@@ -801,6 +1129,61 @@ def list_strategies():
             ]
         }
     )
+
+
+@app.get("/api/strategy-random-summaries")
+def strategy_random_summaries():
+    try:
+        summaries = [_strategy_summary_card(strategy) for strategy in STRATEGIES]
+    except Exception as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"strategies": summaries})
+
+
+@app.post("/api/strategies/<strategy_id>/random-summary")
+def build_strategy_random_summary(strategy_id: str):
+    strategy = _strategy_by_id(strategy_id)
+    if strategy is None:
+        return jsonify({"error": f"Unknown strategy id: {strategy_id}"}), 404
+    try:
+        summary = _load_or_build_random_summary(strategy)
+    except Exception as error:
+        return jsonify({"error": str(error)}), 400
+    return jsonify({"ok": True, "strategy": _strategy_summary_card(strategy), "summary": summary})
+
+
+@app.post("/api/strategies/<strategy_id>/random-summary-job")
+def start_strategy_random_summary_job(strategy_id: str):
+    strategy = _strategy_by_id(strategy_id)
+    if strategy is None:
+        return jsonify({"error": f"Unknown strategy id: {strategy_id}"}), 404
+    job_id = uuid4().hex
+    _set_random_job(
+        job_id,
+        state="starting",
+        strategy_id=strategy["id"],
+        label=strategy["label"],
+        current_seed=None,
+        seed_count=0,
+        completed=0,
+        result_path=None,
+        error=None,
+    )
+    thread = threading.Thread(
+        target=_run_random_summary_job,
+        args=(job_id, strategy),
+        daemon=True,
+    )
+    thread.start()
+    return jsonify({"ok": True, "job_id": job_id, "job": _get_random_job(job_id)})
+
+
+@app.get("/api/random-summary-jobs/<job_id>")
+def get_random_summary_job(job_id: str):
+    job = _get_random_job(job_id)
+    if job is None:
+        return jsonify({"error": f"Unknown job id: {job_id}"}), 404
+    return jsonify({"job": job})
 
 
 @app.get("/api/results/<result_id>")
@@ -880,6 +1263,182 @@ def run_strategy_simulation():
             "result_path": str(output_path.relative_to(PROJECT_ROOT)),
             "dashboard": dashboard,
             "results": _discover_result_files(),
+        }
+    )
+
+
+@app.post("/api/random-runs")
+def run_random_summary():
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+
+    strategy_id = str(payload.get("strategy_id") or "fifo")
+    strategy = _strategy_by_id(strategy_id)
+    if strategy is None:
+        return jsonify({"error": f"Unknown strategy id: {strategy_id}"}), 400
+
+    output_name = str(payload.get("output_name") or f"{strategy_id}_random_run_result.json")
+    if not output_name.endswith(".json"):
+        output_name = f"{output_name}.json"
+    output_path = RESULT_DIR / _safe_result_name(output_name)
+    RESULT_DIR.mkdir(exist_ok=True)
+
+    try:
+        result = build_random_run_result(
+            strategy_spec=strategy["spec"],
+            strategy_params_path=strategy["params_path"],
+            factory_path=FAB_CONFIG_DIR / "factory_config.json",
+            product_path=FAB_CONFIG_DIR / "product_config.json",
+            machine_path=MACHINE_CONFIG_DIR / "machine_config.json",
+            orders_path=ORDER_CONFIG_DIR / "order_config.json",
+            simulation_path=FAB_CONFIG_DIR / "simulation_config.json",
+            seeds_path=FAB_CONFIG_DIR / "simulation_seeds.json",
+        )
+        save_random_run_result(result, output_path)
+    except Exception as error:
+        return jsonify({"error": str(error)}), 400
+
+    result_id = output_path.stem.replace("_result", "")
+    dashboard = compute_random_run_dashboard(result)
+    DASHBOARD_CACHE[result_id] = (
+        _dashboard_cache_token(result_id),
+        dashboard,
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "result_id": result_id,
+            "result_path": str(output_path.relative_to(PROJECT_ROOT)),
+            "dashboard": dashboard,
+            "results": _discover_result_files(),
+        }
+    )
+
+
+@app.post("/api/random-runs/<result_id>/seeds/<int:seed_index>/detail")
+def run_random_seed_detail(result_id: str, seed_index: int):
+    try:
+        summary_path = _result_path_by_id(result_id)
+        summary = _load_json_file(summary_path)
+    except KeyError:
+        return jsonify({"error": f"Unknown result id: {result_id}"}), 404
+    if not summary or summary.get("result_kind") != "random_run_summary":
+        return jsonify({"error": f"Result {result_id} is not a random-run summary."}), 400
+    if seed_index < 1 or seed_index > int(_num(summary.get("seed_count"))):
+        return jsonify({"error": f"seed_index must be between 1 and {summary.get('seed_count')}."}), 400
+
+    strategy_spec = str(summary.get("strategy_spec") or "")
+    if not strategy_spec:
+        return jsonify({"error": "Random-run summary does not contain strategy_spec."}), 400
+    params_value = summary.get("strategy_params_path")
+    params_path = Path(params_value) if params_value else None
+    if params_path is not None and not params_path.is_absolute():
+        params_path = PROJECT_ROOT / params_path
+
+    output_path = RESULT_DIR / f"{result_id}_seed_{seed_index:02d}_result.json"
+    try:
+        result = run_simulation_from_files(
+            strategy_spec=strategy_spec,
+            strategy_params_path=params_path,
+            factory_path=FAB_CONFIG_DIR / "factory_config.json",
+            product_path=FAB_CONFIG_DIR / "product_config.json",
+            machine_path=MACHINE_CONFIG_DIR / "machine_config.json",
+            orders_path=ORDER_CONFIG_DIR / "order_config.json",
+            simulation_path=FAB_CONFIG_DIR / "simulation_config.json",
+            seeds_path=FAB_CONFIG_DIR / "simulation_seeds.json",
+            seed_index=seed_index,
+        )
+        save_result(result, output_path)
+    except Exception as error:
+        return jsonify({"error": str(error)}), 400
+
+    detail_id = output_path.stem.replace("_result", "")
+    dashboard = compute_dashboard(_normalize_run(result))
+    DASHBOARD_CACHE[detail_id] = (
+        _dashboard_cache_token(detail_id),
+        dashboard,
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "result_id": detail_id,
+            "result_path": str(output_path.relative_to(PROJECT_ROOT)),
+            "dashboard": dashboard,
+            "results": _discover_result_files(),
+        }
+    )
+
+
+@app.post("/api/strategies/<strategy_id>/seeds/<int:seed_index>/detail")
+def run_strategy_seed_detail(strategy_id: str, seed_index: int):
+    strategy = _strategy_by_id(strategy_id)
+    if strategy is None:
+        return jsonify({"error": f"Unknown strategy id: {strategy_id}"}), 404
+
+    try:
+        summary = _load_or_build_random_summary(strategy)
+    except Exception as error:
+        return jsonify({"error": str(error)}), 400
+    if seed_index < 1 or seed_index > int(_num(summary.get("seed_count"))):
+        return jsonify({"error": f"seed_index must be between 1 and {summary.get('seed_count')}."}), 400
+
+    output_path = RESULT_DIR / f"{strategy_id}_seed_{seed_index:02d}_result.json"
+    try:
+        result = run_simulation_from_files(
+            strategy_spec=strategy["spec"],
+            strategy_params_path=strategy["params_path"],
+            factory_path=FAB_CONFIG_DIR / "factory_config.json",
+            product_path=FAB_CONFIG_DIR / "product_config.json",
+            machine_path=MACHINE_CONFIG_DIR / "machine_config.json",
+            orders_path=ORDER_CONFIG_DIR / "order_config.json",
+            simulation_path=FAB_CONFIG_DIR / "simulation_config.json",
+            seeds_path=FAB_CONFIG_DIR / "simulation_seeds.json",
+            seed_index=seed_index,
+        )
+        save_result(result, output_path)
+    except Exception as error:
+        return jsonify({"error": str(error)}), 400
+
+    detail_id = output_path.stem.replace("_result", "")
+    dashboard = compute_dashboard(_normalize_run(result))
+    DASHBOARD_CACHE[detail_id] = (
+        _dashboard_cache_token(detail_id),
+        dashboard,
+    )
+    return jsonify(
+        {
+            "ok": True,
+            "result_id": detail_id,
+            "result_path": str(output_path.relative_to(PROJECT_ROOT)),
+            "dashboard": dashboard,
+        }
+    )
+
+
+@app.get("/api/strategies/<strategy_id>/seeds/<int:seed_index>/summary")
+def get_strategy_seed_summary(strategy_id: str, seed_index: int):
+    strategy = _strategy_by_id(strategy_id)
+    if strategy is None:
+        return jsonify({"error": f"Unknown strategy id: {strategy_id}"}), 404
+    summary = _load_random_summary(strategy)
+    if not summary:
+        return jsonify({"error": f"{strategy['label']} has no random-run summary yet."}), 404
+    seed_runs = summary.get("runs", [])
+    run = next(
+        (item for item in seed_runs if int(_num(item.get("seed_index"))) == seed_index),
+        None,
+    )
+    if run is None:
+        return jsonify({"error": f"Seed {seed_index} was not found."}), 404
+    return jsonify(
+        {
+            "strategy_id": strategy_id,
+            "strategy_label": strategy["label"],
+            "seed_index": seed_index,
+            "seed_count": summary.get("seed_count", len(seed_runs)),
+            "seed_set": run.get("seed_set", {}),
+            "metrics": run.get("metrics", {}),
         }
     )
 

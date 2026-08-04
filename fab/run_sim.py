@@ -38,6 +38,7 @@ STRATEGY_ALIASES = {
     "BATCHING_FIFO": "strategy.batching_fifo",
     "DBR_v1": "strategy.dbr_v1",
     "DBR_v2": "strategy.dbr_v2",
+    "RL_v1": "strategy.rl_v1",
 }
 
 
