@@ -1,3 +1,4 @@
+<<<<<<< ours
 import math
 
 
@@ -898,3 +899,180 @@ class DynamicDBR:
                 "lambda": self.lam,
             },
         }
+=======
+"""适合实验用的简化 DBR 策略。
+
+它只保留三个可解释规则：以路线负荷/设备数识别 Drum，控制 Drum 前的
+工作量，并优先推进即将到达 Drum 的 lot。复杂的二级瓶颈、参数寻优和
+多层优先级模型不适合这个小型仿真器，也难以验证其实际收益。
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from typing import Any
+
+from fab.engine.eligibility import eligible_lots
+from fab.model.entities import FabModel, LotState, ToolState
+from fab.strategy import StrategyDecision, StrategyState
+
+
+class DynamicDBR:
+    """一个小而可复现的 Drum-Buffer-Rope 派工策略。"""
+
+    name = "Dynamic DBR"
+
+    def __init__(
+        self,
+        parameters: dict[str, Any] | None = None,
+        sub_bottleneck_window: float | None = None,
+        **_: Any,
+    ) -> None:
+        values = parameters or {}
+        self.parameters = {"BL": float(values.get("BL", 1000.0))}
+        self.buffer_limit = self.parameters["BL"]
+        self.sub_bottleneck_window = sub_bottleneck_window
+        self.model: FabModel | None = None
+        self.main_bottleneck: str | None = None
+        self.sub_bottleneck: str | None = None
+        self.previous_BDm: dict[str, float] = {}
+
+    def initialize(self, model: FabModel) -> None:
+        self.model = model
+        self.main_bottleneck = self._find_bottleneck(model)
+
+    def decide(self, state: StrategyState) -> StrategyDecision:
+        if self.main_bottleneck is None:
+            self.main_bottleneck = self._find_bottleneck(state.model)
+        self.previous_BDm = self._buffer_pressure(state)
+        self.sub_bottleneck = self._largest_pressure_except(self.main_bottleneck)
+
+        dispatches: dict[str, LotState] = {}
+        explanations: dict[str, object] = {}
+        reserved_lot_ids: set[str] = set()
+        for tool in sorted(
+            state.tool_states.values(), key=lambda item: (item.available_time, item.id)
+        ):
+            candidates = [
+                lot
+                for lot in eligible_lots(
+                    state.model, tool, list(state.lots), state.current_time
+                )
+                if lot.id not in reserved_lot_ids
+            ]
+            if not candidates:
+                continue
+            selected = min(candidates, key=lambda lot: self._priority(lot, tool))
+            dispatches[tool.tool_id] = selected
+            explanations[tool.tool_id] = {
+                "rule": "按距 Drum 工作量、lot 优先级和 FIFO 排序。",
+                "work_to_drum": self._work_to_drum(selected),
+                "selected_lot_id": selected.id,
+            }
+            reserved_lot_ids.add(selected.id)
+
+        buffer_work = self.get_remaining_bottleneck_load(state, self.main_bottleneck)
+        can_release = state.release_opportunity and state.waiting_lot_count > 0
+        return StrategyDecision(
+            dispatches=dispatches,
+            release_lot=can_release and buffer_work < self.buffer_limit,
+            diagnostics={
+                "strategy": {
+                    "name": self.name,
+                    "drum": self.main_bottleneck,
+                    "buffer_work": round(buffer_work, 3),
+                    "buffer_limit": self.buffer_limit,
+                    "secondary_pressure": self.previous_BDm,
+                },
+                "release": {
+                    "rule": "Drum 前工作量低于 buffer_limit 时投料。",
+                    "action": "release" if can_release and buffer_work < self.buffer_limit else "hold",
+                },
+                "dispatches": explanations,
+            },
+        )
+
+    def cal_capacity_rate(self, tools: list[ToolState]) -> float:
+        """返回并行设备数，供 RL 把累计加工时间换算成大致覆盖时间。"""
+
+        return float(len(tools))
+
+    def get_remaining_bottleneck_load(
+        self, state: StrategyState, bottleneck: str | None
+    ) -> float:
+        """计算所有未完成 lot 到下一次 Drum 前（含 Drum）的平均加工时间。"""
+
+        if bottleneck is None:
+            return 0.0
+        return round(
+            sum(
+                work
+                for lot in state.lots
+                if not lot.completed
+                for work in [self._work_to_process(lot, bottleneck)]
+                if work is not None
+            ),
+            3,
+        )
+
+    def result_fields(self) -> dict[str, object]:
+        return {
+            "dbr_parameters": {"buffer_limit": self.buffer_limit},
+            "dbr_drum": self.main_bottleneck,
+        }
+
+    def _find_bottleneck(self, model: FabModel) -> str:
+        demand: dict[str, float] = defaultdict(float)
+        capacity: dict[str, int] = defaultdict(int)
+        product_weights = dict(model.synthetic_order.product_mix)
+        for product in model.products.values():
+            weight = product_weights.get(product.id, 1.0)
+            for operation_id in product.operation_ids:
+                profile = model.operation_profiles[operation_id]
+                demand[profile.process_family] += weight * profile.mean_process_time
+        for tool in model.tools.values():
+            capacity[model.tool_groups[tool.tool_group_id].process_family] += 1
+        return max(demand, key=lambda process: demand[process] / capacity[process])
+
+    def _buffer_pressure(self, state: StrategyState) -> dict[str, float]:
+        work: dict[str, float] = defaultdict(float)
+        tools: dict[str, int] = defaultdict(int)
+        for tool in state.tool_states.values():
+            tools[tool.type] += 1
+        for lot in state.lots:
+            if not lot.completed and not lot.in_process and lot.ready_time <= state.current_time:
+                work[lot.current_process or "Unknown"] += lot.current_process_time or 0.0
+        return {
+            process: round(total / max(tools[process], 1) / self.buffer_limit, 4)
+            for process, total in work.items()
+        }
+
+    def _largest_pressure_except(self, process: str | None) -> str | None:
+        candidates = [item for item in self.previous_BDm.items() if item[0] != process]
+        return max(candidates, key=lambda item: item[1])[0] if candidates else None
+
+    def _priority(self, lot: LotState, tool: ToolState) -> tuple[float, ...]:
+        same_product = 0 if lot.product_id == tool.current_product_id else 1
+        return (
+            self._work_to_drum(lot),
+            -float(lot.priority),
+            same_product,
+            lot.ready_time,
+            lot.release_time,
+            float(lot.input_order),
+        )
+
+    def _work_to_drum(self, lot: LotState) -> float:
+        return self._work_to_process(lot, self.main_bottleneck) or float("inf")
+
+    @staticmethod
+    def _work_to_process(lot: LotState, process: str | None) -> float | None:
+        if process is None or lot.completed:
+            return None
+        work = 0.0
+        for operation in lot.route[lot.operation_index :]:
+            work += float(operation["process_time"])
+            if operation["process"] == process:
+                return work
+        return None
+>>>>>>> theirs

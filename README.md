@@ -94,52 +94,44 @@ git clone https://github.com/xiaozhe19/myFab.git
 cd myFab
 ```
 
-### 3.2 安装依赖
-
-```bash
-pip install -r requirements_dashboard.txt
-```
-
-如果部分依赖没有安装成功，可以手动安装 Flask：
-
-```bash
-pip install flask
-```
-
----
-
 ## 4. 运行仿真
 
 下面以 FIFO 策略为例运行一次仿真：
 
 ```bash
-python -m fab.run_sim --strategy FIFO:FIFOStrategy
+python -m fab.run_model --strategy strategy.fifo:FIFOStrategy
 ```
 
 仿真结果默认会输出到 `result/` 文件夹中。
 
 ---
 
-## 5. 运行可视化面板
+## 5. 训练最小 Release RL
 
-项目包含一个基于 Flask 的简单可视化面板，可以用于运行策略、查看结果和比较不同调度规则。
+当前 RL 第一版只接管投料动作：`0` 表示 hold，`1` 表示 release；设备派工仍由
+Dynamic DBR 完成。实现只依赖 Python 标准库，不需要安装深度学习框架。
 
-运行方式：
-
-```bash
-python fab_dashboard_app.py
-```
-
-或者：
+运行 100 个 episode 的 Q-learning：
 
 ```bash
-python -m dashboard.app
+python -m rl.train --episodes 100
 ```
 
-运行后，在浏览器中打开终端显示的本地地址，通常为：
+默认输出：
 
-```text
-http://127.0.0.1:5000
+- `result/rl_q_table.json`：可以继续加载或部署的 Q 表；
+- `result/rl_training_history.json`：每轮 reward、throughput、WIP、epsilon；
+
+使用未参与训练的一组随机种子进行纯 greedy 评估：
+
+```bash
+python -m rl.evaluate --q-table result/rl_q_table.json --episodes 10
+```
+
+运行 RL 回归测试：
+
+```bash
+python -m unittest tests.test_rl_training
 ```
 
 ---
@@ -151,6 +143,8 @@ http://127.0.0.1:5000
 仿真引擎主要负责推进仿真时间、处理事件、更新 Lot 和设备状态、记录生产历史，并生成输出结果。
 
 调度策略主要负责判断是否释放新的 Lot、设备空闲时选择加工对象，并根据当前系统状态计算任务优先级。
+
+新事件内核的策略接口、两种投料源和手写策略示例见 [Fab 内核与策略接入指南](FAB_KERNEL_GUIDE_ZH.md)。
 
 ---
 

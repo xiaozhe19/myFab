@@ -1,0 +1,74 @@
+"""只收集学习调度所需的结果指标。"""
+# 接入SQL， 用SQLite 还是用MySQL？
+from __future__ import annotations
+
+from fab.model.entities import FabModel, LotState, ToolState
+
+
+class MetricsCollector:
+    def __init__(self, model: FabModel) -> None:
+        self.model = model
+        self.operations: list[dict[str, object]] = []
+        self._wip_area = 0.0
+        self._last_time = model.simulation.start_time
+
+    def advance_time(self, time: float, lots: list[LotState]) -> None:
+        start = max(self._last_time, self.model.simulation.start_time + self.model.simulation.warmup_time)
+        end = min(time, self.model.simulation.end_time)
+        if end > start:
+            wip = sum(lot.release_time <= self._last_time and not lot.completed for lot in lots)
+            self._wip_area += wip * (end - start)
+        self._last_time = time
+
+    def record_operation(
+        self,
+        lot: LotState,
+        tool: ToolState,
+        start: float,
+        end: float,
+        active_duration: float | None = None,
+    ) -> None:
+        duration = end - start if active_duration is None else active_duration
+        self.operations.append({
+            "lot_id": lot.id, "product_id": lot.product_id, "tool_id": tool.tool_id,
+            "process": lot.current_process, "step": lot.operation_index,
+            "start": round(start, 3), "end": round(end, 3), "duration": round(duration, 3),
+        })
+
+    def result(self, strategy: str, lots: list[LotState], tools: dict[str, ToolState]) -> dict[str, object]:
+        self.advance_time(self.model.simulation.end_time, lots)
+        start = self.model.simulation.start_time + self.model.simulation.warmup_time
+        horizon = self.model.simulation.end_time - start
+        completed = [lot for lot in lots if lot.end_time is not None and lot.end_time >= start]
+        cycle_times = [lot.end_time - lot.release_time for lot in completed if lot.end_time is not None]
+        return {
+            "strategy": strategy,
+            "factory_id": self.model.id,
+            "time_unit": self.model.time_unit,
+            "operations": self.operations,
+            "lots": [self._lot_row(lot) for lot in lots],
+            "machines": [{"id": tool.tool_id, "name": tool.name, "process": tool.type} for tool in tools.values()],
+            "measurement": {
+                "throughput": len(completed),
+                "movements": len(self.operations),
+                "mct_average": round(sum(cycle_times) / len(cycle_times), 3) if cycle_times else 0.0,
+                "mct_p95": round(self._percentile(cycle_times, 0.95), 3) if cycle_times else 0.0,
+                "average_fab_wip": round(self._wip_area / horizon, 3) if horizon else 0.0,
+            },
+        }
+
+    @staticmethod
+    def _lot_row(lot: LotState) -> dict[str, object]:
+        return {"id": lot.id, "product_id": lot.product_id, "release_time": lot.release_time,
+                "end_time": lot.end_time, "completed": lot.completed, "step": lot.operation_index,
+                "operation_history": lot.operation_history}
+
+    @staticmethod
+    def _percentile(values: list[float], ratio: float) -> float:
+        if not values:
+            return 0.0
+        values = sorted(values)
+        index = (len(values) - 1) * ratio
+        lower = int(index)
+        upper = min(lower + 1, len(values) - 1)
+        return values[lower] + (values[upper] - values[lower]) * (index - lower)

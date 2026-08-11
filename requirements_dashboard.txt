@@ -1,2 +1,0 @@
-flask>=3.0
-hyperopt>=0.2.7

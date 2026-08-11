@@ -1,1 +1,0 @@
-"""Machine-related simulation components."""
