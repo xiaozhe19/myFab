@@ -22,7 +22,17 @@ class StrategyState:
     release_opportunity: bool
     event_kinds: tuple[str, ...] = ()
     strategy_reasons: tuple[str, ...] = ()
-    last_operation_completion: dict[str, float] = field(default_factory=dict)
+    # 引擎按硬约束计算的候选集合；策略只负责从中选择，不负责重新扫描全部 Lot。
+    eligible_lots_by_tool: dict[str, tuple[LotState, ...]] = field(default_factory=dict)
+    # (process, visit_number) -> 最近一次该工序访问完成的模拟时刻。
+    last_operation_completion: dict[tuple[str, int], float] = field(
+        default_factory=dict
+    )
+    available_tools: tuple[ToolState, ...] = ()
+    # 优化：引擎预计算"当前至少有一个合法候选 lot"的设备，已按
+    # (available_time, tool_id) 排序。策略派工时应优先遍历此列表，避免每次
+    # 决策对全部可用设备（约 1400 台）做无意义遍历与排序。
+    dispatchable_tools: tuple[ToolState, ...] = ()
 
     @property
     def wafers(self) -> tuple[LotState, ...]:

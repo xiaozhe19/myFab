@@ -4,6 +4,6 @@
 """
 
 from fab.engine.engine import FabEngine
-from fab.engine.eligibility import eligible_lots, eligible_tools, tool_can_process
+from fab.engine.eligibility import eligible_lots, tool_can_process
 
-__all__ = ["FabEngine", "eligible_lots", "eligible_tools", "tool_can_process"]
+__all__ = ["FabEngine", "eligible_lots", "tool_can_process"]

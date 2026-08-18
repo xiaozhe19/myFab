@@ -50,7 +50,8 @@
 
 ### 2.2 可配置的 Fab 系统
 
-项目使用 JSON 文件配置工厂环境，包括：
+项目将 SMT Excel 原样导入 SQLite。SQLite 保存工作表表头、原始行及用户提供的仿真时间配置；
+运行时由模型构造模块在内存中生成工厂环境，包括：
 
 - 产品类型；
 - 产品工艺路线；
@@ -59,8 +60,8 @@
 - 订单到达规律；
 - 设备数量和设备状态；
 - 仿真时间；
-- 随机种子；
-- 调度策略参数。
+
+随机种子由每次运行命令提供；策略参数仍可使用独立 JSON 文件。
 
 例如，同一个工序可以配置多个可用设备，并且每台设备可以有不同的加工时间。这可以模拟真实 Fab 中“同一 Recipe 在不同设备上耗时不同”的情况。
 
@@ -96,13 +97,31 @@ cd myFab
 
 ## 4. 运行仿真
 
-下面以 FIFO 策略为例运行一次仿真：
+正式运行从 SQLite 模型库读取。先将一个 SMT2020 工作簿导入模型库；SMT 文件
+不包含仿真结束时刻和策略投料节拍，所以它们必须显式以 minute 提供：
 
 ```bash
-python -m fab.run_model --strategy strategy.fifo:FIFOStrategy
+python -m fab.importer \
+  --input "smt2020/General Data/dataset 1/SMT_2020_Model_Data_-_HVLM.xlsx" \
+  --database data/model/hvlm.sqlite \
+  --end-time 18000 \
+  --release-interval 30 \
+  --warmup-time 3600
 ```
 
-仿真结果默认会输出到 `result/` 文件夹中。
+然后以 FIFO 策略运行一次仿真：
+
+```bash
+python -m fab.run_model \
+  --model-database data/model/hvlm.sqlite \
+  --strategy FIFO \
+  --result-database data/result/simulation_results.sqlite
+```
+
+模型库不保存产品、路线、设备等派生对象，只保存原始 SMT 表；每次运行时在内存中构造
+`FabModel`。结果库按 `run_id` 追加保存 lot、设备、工序记录和聚合 metrics。内核和结果
+库的规范时间单位均为 minute。运行时会显示进度条、百分比及模拟时间进度（当前时间／总
+模拟时长）。
 
 ---
 

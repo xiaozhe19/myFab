@@ -6,7 +6,11 @@ from fab.model.entities import FabModel, LotState, RouteStepSpec, ToolState
 
 
 def tool_can_process(model: FabModel, tool_id: str, lot: LotState) -> bool:
-    """检查静态工具组资格及 lot-to-lens dedication。"""
+    """检查静态工具组资格及 lot-to-lens dedication。
+
+    ``tool_group_id`` 是唯一的设备加工资格约束；``process`` 只是供 metrics
+    和策略进行工艺/区域统计的分类字段，不能再作为第二套资格条件。
+    """
 
     step = lot.current_step
     tool = model.tools.get(tool_id)
@@ -15,8 +19,6 @@ def tool_can_process(model: FabModel, tool_id: str, lot: LotState) -> bool:
     if step.tool_group_id is None or tool.tool_group_id is None:
         return False
     if step.tool_group_id != tool.tool_group_id:
-        return False
-    if step.process != tool.process:
         return False
     return lot.dedicated_tool_id in {None, tool_id}
 
@@ -32,9 +34,7 @@ def tool_is_available(tool: ToolState, current_time: float) -> bool:
     )
 
 
-def setup_change_allowed(
-    model: FabModel, tool: ToolState, step: RouteStepSpec
-) -> bool:
+def setup_change_allowed(model: FabModel, tool: ToolState, step: RouteStepSpec) -> bool:
     """执行 setup minimum run length 这一硬约束。"""
 
     required_setup = step.required_setup
@@ -68,24 +68,6 @@ def eligible_lots(
         if not lot.in_process
         and not lot.completed
         and lot.ready_time <= current_time
-        and tool_can_process(model, tool.tool_id, lot)
-        and lot.current_step is not None
-        and setup_change_allowed(model, tool, lot.current_step)
-    ]
-
-
-def eligible_tools(
-    model: FabModel,
-    tool_states: dict[str, ToolState],
-    lot: LotState,
-    current_time: float,
-) -> list[ToolState]:
-    """返回可加工指定 Lot 的未排序设备集合。"""
-
-    return [
-        tool
-        for tool in tool_states.values()
-        if tool_is_available(tool, current_time)
         and tool_can_process(model, tool.tool_id, lot)
         and lot.current_step is not None
         and setup_change_allowed(model, tool, lot.current_step)

@@ -1,4 +1,4 @@
-"""Fab 领域模型与配置加载入口。"""
+"""Fab 领域模型与加载入口。"""
 
 from fab.model.entities import (
     BreakdownSpec,
@@ -19,13 +19,27 @@ from fab.model.entities import (
     ToolState,
     TransportRuleSpec,
 )
-from fab.model.loader import load_fab_model
+from fab.model.sqlite_loader import load_fab_model_from_sqlite
+from fab.model.smt_model_builder import build_fab_model
 
 __all__ = [
-    "BreakdownSpec", "DistributionSpec", "FabModel",
-    "LotReleaseSpec", "LotState", "LotTypeSpec", "PreventiveMaintenanceSpec",
+    "BreakdownSpec",
+    "DistributionSpec",
+    "FabModel",
+    "LotReleaseSpec",
+    "LotState",
+    "LotTypeSpec",
+    "PreventiveMaintenanceSpec",
     "ProductSpec",
-    "RecipeSpec", "RouteStepSpec", "SetupTransitionSpec",
-    "SimulationSpec", "SyntheticOrderSpec", "ToolGroupSpec",
-    "ToolSpec", "ToolState", "TransportRuleSpec", "load_fab_model",
+    "RecipeSpec",
+    "RouteStepSpec",
+    "SetupTransitionSpec",
+    "SimulationSpec",
+    "SyntheticOrderSpec",
+    "ToolGroupSpec",
+    "ToolSpec",
+    "ToolState",
+    "TransportRuleSpec",
+    "build_fab_model",
+    "load_fab_model_from_sqlite",
 ]

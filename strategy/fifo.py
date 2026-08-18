@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from fab.engine.eligibility import eligible_lots
 from fab.model.entities import FabModel, LotState
 from fab.strategy import FabStrategy, StrategyDecision, StrategyState
 
@@ -19,9 +18,12 @@ class FIFOStrategy(FabStrategy):
         dispatches: dict[str, LotState] = {}
         explanations: dict[str, object] = {}
         reserved_lot_ids: set[str] = set()
-        for tool in sorted(state.tool_states.values(), key=lambda item: (item.available_time, item.tool_id)):
+        # 优化：引擎已按 (available_time, tool_id) 预排序好"有候选设备"列表，
+        # 无需再对全部可用设备排序与过滤。
+        for tool in state.dispatchable_tools:
             candidates = [
-                lot for lot in eligible_lots(state.model, tool, list(state.lots), state.current_time)
+                lot
+                for lot in state.eligible_lots_by_tool.get(tool.tool_id, ())
                 if lot.id not in reserved_lot_ids
             ]
             if not candidates:

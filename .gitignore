@@ -7,3 +7,7 @@ __pycache__/*
 result
 smt2020
 smt2020/*
+data
+data/*
+docs
+docs/*

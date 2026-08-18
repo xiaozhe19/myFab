@@ -5,27 +5,18 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import time
 from pathlib import Path
+from typing import Callable
 
 from fab.engine import FabEngine
-from fab.model import load_fab_model
+from fab.metrics_sqlite import save_simulation_result
+from fab.model import load_fab_model_from_sqlite
 from strategy.fifo import FIFOStrategy
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL_PATH = PROJECT_ROOT / "fab" / "config" / "fab_model.json"
-DEFAULT_OUTPUT_PATH = PROJECT_ROOT / "result" / "fifo_v2_result.json"
-
-
-def save_result(result: dict[str, object], path: Path) -> None:
-    """原子写出新引擎结果，避免读取方读到半个 JSON 文件。"""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f".{path.name}.tmp")
-    with temporary_path.open("w", encoding="utf-8") as file:
-        json.dump(result, file, ensure_ascii=False, indent=2)
-        file.write("\n")
-    temporary_path.replace(path)
+DEFAULT_MODEL_DATABASE = PROJECT_ROOT / "data" / "model" / "fab_model.sqlite"
+DEFAULT_RESULT_DATABASE = PROJECT_ROOT / "data" / "result" / "simulation_results.sqlite"
 
 
 def _load_json_object(path: Path | None) -> dict[str, object]:
@@ -54,54 +45,95 @@ def build_strategy(spec: str, parameters: dict[str, object] | None = None):
     return strategy
 
 
-def run_simulation_from_model(
+def run_simulation_from_database(
     strategy_spec: str,
-    model_path: Path,
+    model_database: Path,
     order_seed: int,
     strategy_params_path: Path | None = None,
-    diagnostic_mode: bool = False,
+    progress_callback: Callable[[float, float], None] | None = None,
 ) -> dict[str, object]:
-    """用新配置运行任一已接入策略。"""
+    """从 SQLite 模型库运行任一已接入策略。"""
 
-    model = load_fab_model(model_path)
+    model = load_fab_model_from_sqlite(model_database)
     strategy = build_strategy(strategy_spec, _load_json_object(strategy_params_path))
     return FabEngine(
-        model, order_seed=order_seed, diagnostic_mode=diagnostic_mode
+        model,
+        order_seed=order_seed,
+        progress_callback=progress_callback,
     ).run(strategy)
 
 
-def run_fifo(model_path: Path, order_seed: int) -> dict[str, object]:
-    """保留一个简短的 FIFO 便捷入口。"""
+# 优化：进度条计时起始时刻（首次调用时初始化）。
+_PROGRESS_START_TIME: float | None = None
 
-    return run_simulation_from_model("FIFO", model_path, order_seed)
+
+def _print_progress(current_time: float, total_time: float) -> None:
+    global _PROGRESS_START_TIME
+    # 优化：第一次显示进度时记录仿真墙钟起点，用于展示已运行时长。
+    if _PROGRESS_START_TIME is None:
+        _PROGRESS_START_TIME = time.perf_counter()
+    elapsed = time.perf_counter() - _PROGRESS_START_TIME
+    progress = current_time / total_time if total_time else 1.0
+    width = 30
+    completed = int(width * progress)
+    bar = "=" * completed + ">" + " " * max(width - completed - 1, 0)
+    print(
+        f"\rProgress [{bar}] {progress:6.1%} "
+        f"simulation time {current_time:.1f}/{total_time:.1f} min "
+        f"elapsed {elapsed:6.1f}s",
+        end="",
+        flush=True,
+    )
+    if progress >= 1.0:
+        print()
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the v2 fab model.")
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH)
+    parser = argparse.ArgumentParser(description="Run the fab model from SQLite.")
+    parser.add_argument("--model-database", type=Path, default=DEFAULT_MODEL_DATABASE)
     parser.add_argument("--strategy", default="FIFO")
     parser.add_argument("--strategy-params", type=Path)
     parser.add_argument("--order-seed", type=int, default=2026061700)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_PATH)
+    parser.add_argument("--result-database", type=Path, default=DEFAULT_RESULT_DATABASE)
     args = parser.parse_args()
 
-    result = run_simulation_from_model(
+    # 优化：记录仿真的墙钟运行时长，供进度条与结果入库使用。
+    run_started_at = time.perf_counter()
+    result = run_simulation_from_database(
         args.strategy,
-        args.model,
+        args.model_database,
         args.order_seed,
         args.strategy_params,
+        progress_callback=_print_progress,
     )
-    save_result(result, args.output)
+    elapsed_seconds = time.perf_counter() - run_started_at
+    # 优化：把运行时长写入结果字典，metrics_sqlite 会一并存入 runs 表。
+    result["elapsed_seconds"] = round(elapsed_seconds, 3)
+    run_id = save_simulation_result(result, args.result_database)
     measurement = result["measurement"]
     print(
         f"{result['strategy']} finished: "
         f"throughput {measurement['throughput']}, "
         f"movements {measurement['movements']}, "
         f"MCT P95 {measurement['mct_p95']}, "
-        f"average WIP {measurement['average_fab_wip']}."
+        f"average WIP {measurement['average_fab_wip']}, "
+        f"elapsed {result['elapsed_seconds']:.1f}s."
     )
-    print(f"Saved result to {args.output}")
+    print(f"Saved run {run_id} to {args.result_database}")
 
 
 if __name__ == "__main__":
+    # 优化：添加cProfile以便优化策略/内核性能
+    import cProfile
+    import pstats
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+
     main()
+
+    profiler.disable()
+
+    stats = pstats.Stats(profiler)
+    stats.sort_stats("cumulative")
+    stats.print_stats(50)

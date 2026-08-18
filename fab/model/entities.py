@@ -52,6 +52,7 @@ class ToolSpec:
     """一台具体设备。
 
     SMT 原始文件通常只给出工具组数量；本项目展开成单台设备，方便事件引擎派工。
+    ``tool_group_id`` 表示精确加工资格；``process`` 是工艺/区域统计分类。
     前四个字段保留当前教学模型的构造方式。
     """
 
@@ -125,7 +126,11 @@ class RecipeSpec:
 
 @dataclass(frozen=True)
 class RouteStepSpec:
-    """Route_Product_i 的一条路线工步。"""
+    """Route_Product_i 的一条路线工步。
+
+    ``tool_group_id`` 是该工步的唯一精确加工资格；``process`` 是用于 metrics
+    与策略的工艺/区域统计分类，不能替代工具组资格。
+    """
 
     process: str
     process_time: float
@@ -150,7 +155,6 @@ class RouteStepSpec:
     critical_queue_time_step: str | None = None
     critical_queue_time: float | None = None
     critical_queue_time_unit: str | None = None
-
 
 
 @dataclass(frozen=True)
@@ -298,6 +302,3 @@ class LotState:
     @property
     def current_process_time(self) -> float | None:
         return self.current_step.process_time if self.current_step else None
-
-    def is_complete(self, _: ProductSpec | None = None) -> bool:
-        return self.completed
