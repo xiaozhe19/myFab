@@ -280,7 +280,10 @@ class LotState:
     lot_type_id: str | None = None
     wafer_count: int = 25
     is_super_hot: bool = False
-    dedicated_tool_id: str | None = None
+    # LTL 链式绑定：{目标工步 id: 绑定设备 id}。一个 lot 可同时有多个进行中的
+    # LTL 绑定（如 step12 绑定供 step113 用、step57 绑定供 step79 用），
+    # 各自独立互不覆盖。lot 到达目标工步时必须回对应绑定设备。
+    dedicated_tools: dict[str, str] = field(default_factory=dict)
     operation_history: list[dict[str, object]] = field(default_factory=list)
 
     @property

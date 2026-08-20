@@ -68,6 +68,9 @@ class StrategyDecision:
     release_lot: bool = False
     # 可选定向投料。给出时隐含放行，且必须引用当前订单池中的一个 lot。
     release_lot_id: str | None = None
+    # 预留：策略主动组批 tool_id -> 同炉 lot 列表。仅在引擎
+    # batch_from_strategy=True 时生效；缺省 None 表示引擎自主组批。
+    batches: dict[str, list[LotState]] = field(default_factory=dict)
     wakeups: list[tuple[float, str]] = field(default_factory=list)
     # 策略可选地写入决策解释；引擎只保存，不参与算法或动作校验。
     diagnostics: dict[str, object] = field(default_factory=dict)

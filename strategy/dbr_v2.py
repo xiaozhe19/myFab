@@ -12,6 +12,8 @@ class DynamicDBR:
 
     name = "Dynamic DBR"
     run_id = "dynamic-dbr-v2"
+    # DBR 只使用 Engine 已筛好的 dispatchable_tools，不需要完整空闲设备快照。
+    requires_available_tools = False
 
     def __init__(
         self,
@@ -61,10 +63,36 @@ class DynamicDBR:
         # 每个 (mbottleneck, product_id) 的 layer_list 完全相同，因此按产品预计算一次，
         # 避免每次决策对每个 lot 重复扫描整条路线（原热点 build_layer_list 被调用数万次）。
         self._layer_cache: dict[tuple[str, str], list[dict[str, object]]] = {}
-        # 优化：每次 decide 开始时一次性汇总各 operation 的排队工作量与设备产能，
-        # 供 cal_Bi 查表，避免对全 WIP 反复线性扫描。
+        # 同一静态 Layer 的两个反向索引：step -> layer 用于当前 lot 定位，
+        # layer -> PT/FT 用于累计 Layer load，避免在每个 lot 上再次扫路线。
+        self._layer_by_step: dict[tuple[str, str], tuple[int | None, ...]] = {}
+        self._layer_load_weight: dict[tuple[str, str], dict[int, float]] = {}
+        # 这两个值均只取决于路线和静态平均可用率，因此可跨所有决策复用。
+        self._heartbeat_cache: dict[tuple[str, int], float] = {}
+        self._operation_keys_by_product: dict[str, tuple[tuple[str, int], ...]] = {}
+        self._bottleneck_visits: dict[
+            tuple[str, str], tuple[int | None, ...]
+        ] = {}
+        # 以下三个容器是“当前决策时刻”的动态快照，会在 decide 中一起重建；
+        # 不跨事件缓存，避免 WIP 改变后读到陈旧值。
         self._operation_buffers: dict[tuple[str, int], float] = {}
+        self._layer_loads: dict[int, float] = {}
+        self._bottleneck_queue_load = 0.0
+        # 产能是同工艺设备长期平均可用率之和，按本 DBR 定义不随瞬时故障改变，
+        # 所以在 initialize 中一次求好即可。
         self._operation_capacity_cache: dict[str, float] = {}
+        for product_id, product in model.products.items():
+            visits: dict[str, int] = {}
+            keys: list[tuple[str, int]] = []
+            for step in product.route:
+                visits[step.process] = visits.get(step.process, 0) + 1
+                keys.append((step.process, visits[step.process]))
+            self._operation_keys_by_product[product_id] = tuple(keys)
+        for spec in model.tools.values():
+            self._operation_capacity_cache[spec.process] = (
+                self._operation_capacity_cache.get(spec.process, 0.0)
+                + self.machine_availability[spec.id]
+            )
         self.previous_BDm = {process: 0.0 for process in self.process_names}
         self.main_bottleneck = None
         self.sub_bottleneck = None
@@ -78,22 +106,34 @@ class DynamicDBR:
             return cached
         wafer = self.model.products[product_id]
         layers = []
+        layer_by_step: list[int | None] = [None] * len(wafer.route)
+        load_weight: dict[int, float] = {}
         layer_start = 0
         for step, operation in enumerate(wafer.route):
             if operation.process != mbottleneck:
                 continue
             layer_operations = wafer.route[layer_start : step + 1]
+            layer_number = len(layers) + 1
+            pt = float(operation.process_time)
+            ft = sum(float(item.process_time) for item in layer_operations)
             layers.append(
                 {
-                    "layer": len(layers) + 1,
+                    "layer": layer_number,
                     "start_step": layer_start,
                     "end_step": step,
-                    "PT": float(operation.process_time),
-                    "FT": sum(float(item.process_time) for item in layer_operations),
+                    "PT": pt,
+                    "FT": ft,
                 }
             )
+            for index in range(layer_start, step + 1):
+                layer_by_step[index] = layer_number
+            if ft > 0:
+                load_weight[layer_number] = pt / ft
             layer_start = step + 1
+        # layers 是策略对外使用的原结构；两个辅助索引仅服务性能，不改变公式。
         self._layer_cache[key] = layers
+        self._layer_by_step[key] = tuple(layer_by_step)
+        self._layer_load_weight[key] = load_weight
         return layers
 
     # 产能与瓶颈识别
@@ -282,26 +322,25 @@ class DynamicDBR:
     def get_layer_load(self, mbottleneck, wafers):
         """统计各层当前 WIP 的 Layer Load。
 
-        优化：只依赖各 lot 当前所属 layer 与其 (PT, FT)，而 (PT, FT) 由静态
-        模型决定。调用方（decide）在瓶颈未变化时复用上次结果，避免每次决策
-        都全量扫描 WIP；这里仍保留完整计算，供瓶颈刷新时重算。
+        Layer 归属和 PT / FT 权重均为静态缓存；每次决策只扫描动态 WIP 并累加。
         """
         layer_load_list = {}
         for wafer in wafers:
-            if wafer.completed:
+            step = wafer.operation_index
+            if step >= len(wafer.route):
                 continue
-            layer_list = self.build_layer_list(
-                mbottleneck,
-                wafer,
-            )
-            layer = self.get_layer(layer_list, wafer)
+            key = (mbottleneck, wafer.product_id)
+            layer_by_step = self._layer_by_step.get(key)
+            if layer_by_step is None:
+                self._build_layers_for_product(*key)
+                layer_by_step = self._layer_by_step[key]
+            layer = layer_by_step[step]
             if layer is None:
                 continue
-            PT = self.cal_PT(layer_list).get(layer, 0.0)
-            FT = self.cal_FT(layer_list).get(layer, 0.0)
-            if FT <= 0:
+            weight = self._layer_load_weight[key].get(layer)
+            if weight is None:
                 continue
-            layer_load_list[layer] = layer_load_list.get(layer, 0.0) + PT / FT
+            layer_load_list[layer] = layer_load_list.get(layer, 0.0) + weight
         return layer_load_list
 
     def cal_bottleneck_heartbeat(
@@ -310,15 +349,21 @@ class DynamicDBR:
         mbottleneck,
         layer_list,
     ):
-        """计算主瓶颈 Drum 节拍 Dt。"""
-        process_machines = [
-            machine for machine in state.machines if machine.type == mbottleneck
-        ]
-        capacity_rate = self.cal_capacity_rate(process_machines)
+        """计算主瓶颈 Drum 节拍 Dt。
+
+        ``layer_list`` 来自静态 layer cache，且产能也为静态平均值，故同一
+        主瓶颈与同一列表对象的结果可安全跨决策缓存。
+        """
+        key = (mbottleneck, id(layer_list))
+        cached = self._heartbeat_cache.get(key)
+        if cached is not None:
+            return cached
+        capacity_rate = self._operation_capacity_cache.get(mbottleneck, 0.0)
         if capacity_rate <= 0:
             return float("inf")
-        total_bottleneck_pt = sum(self.cal_PT(layer_list).values())
-        return total_bottleneck_pt / capacity_rate
+        heartbeat = sum(float(layer["PT"]) for layer in layer_list) / capacity_rate
+        self._heartbeat_cache[key] = heartbeat
+        return heartbeat
 
     # Operation Buffer
     def get_operation_key(self, wafer, step=None):
@@ -326,11 +371,7 @@ class DynamicDBR:
         step = wafer.step if step is None else step
         if step < 0 or step >= len(wafer.route):
             return None
-        process = wafer.route[step].process
-        visit_number = sum(
-            1 for operation in wafer.route[: step + 1] if operation.process == process
-        )
-        return process, visit_number
+        return self._operation_keys_by_product[wafer.product_id][step]
 
     def _build_operation_buffer(self, state):
         """按 operation_key 汇总各操作前排队 lot 的加工工作量。
@@ -343,21 +384,57 @@ class DynamicDBR:
         current_time = state.current_time
         buffers: dict[tuple[str, int], float] = {}
         for wafer in state.wafers:
-            if wafer.completed or wafer.in_process or wafer.ready_time > current_time:
+            step = wafer.operation_index
+            if (
+                step >= len(wafer.route)
+                or wafer.in_process
+                or wafer.ready_time > current_time
+            ):
                 continue
-            key = self.get_operation_key(wafer)
-            if key is None:
-                continue
+            key = self._operation_keys_by_product[wafer.product_id][step]
             buffers[key] = buffers.get(key, 0.0) + float(
-                wafer.current_process_time or 0.0
+                wafer.route[step].process_time
             )
         return buffers
 
+    def _build_wip_indexes(self, state, mbottleneck):
+        """一次扫描当前 WIP，汇总 DBR 本轮决策需要的所有动态量。
+
+        Layer load 包含所有尚未完成的 lot；operation buffer 和瓶颈前队列只
+        包含已经到站、且未在加工的 lot。这保持原三个独立扫描的统计口径。
+        """
+
+        current_time = state.current_time
+        buffers: dict[tuple[str, int], float] = {}
+        layer_loads: dict[int, float] = {}
+        bottleneck_queue_load = 0.0
+        for wafer in state.wafers:
+            step = wafer.operation_index
+            if step >= len(wafer.route):
+                continue
+            layer_key = (mbottleneck, wafer.product_id)
+            layer_by_step = self._layer_by_step.get(layer_key)
+            if layer_by_step is None:
+                self._build_layers_for_product(*layer_key)
+                layer_by_step = self._layer_by_step[layer_key]
+            layer = layer_by_step[step]
+            if layer is not None:
+                weight = self._layer_load_weight[layer_key].get(layer)
+                if weight is not None:
+                    layer_loads[layer] = layer_loads.get(layer, 0.0) + weight
+
+            if wafer.in_process or wafer.ready_time > current_time:
+                continue
+            operation_key = self._operation_keys_by_product[wafer.product_id][step]
+            process_time = float(wafer.route[step].process_time)
+            buffers[operation_key] = buffers.get(operation_key, 0.0) + process_time
+            if operation_key[0] == mbottleneck:
+                bottleneck_queue_load += process_time
+        return layer_loads, buffers, bottleneck_queue_load
+
     def _operation_capacity(self, state, process):
         """返回某 process 对应设备的有效产能率。"""
-        return self.cal_capacity_rate(
-            [machine for machine in state.machines if machine.type == process]
-        )
+        return self._operation_capacity_cache.get(process, 0.0)
 
     def cal_Bi(self, state, operation_key):
         """计算操作 i 前 Buffer 的预计清空时间。
@@ -393,13 +470,20 @@ class DynamicDBR:
         step = wafer.step if step is None else step
         if step < 0 or step >= len(wafer.route):
             return None
-        if wafer.route[step].process != mbottleneck:
-            return None
-        return sum(
-            1
-            for operation in wafer.route[: step + 1]
-            if operation.process == mbottleneck
-        )
+        key = (mbottleneck, wafer.product_id)
+        visits = self._bottleneck_visits.get(key)
+        if visits is None:
+            count = 0
+            values: list[int | None] = []
+            for operation in wafer.route:
+                if operation.process == mbottleneck:
+                    count += 1
+                    values.append(count)
+                else:
+                    values.append(None)
+            visits = tuple(values)
+            self._bottleneck_visits[key] = visits
+        return visits[step]
 
     # Compound Priority
 
@@ -520,7 +604,7 @@ class DynamicDBR:
             and wafer.current_process == mbottleneck
         )
 
-    def cal_Pri(self, state, mbottleneck, BL, r):
+    def cal_Pri(self, state, mbottleneck, BL, r, queue_load=None):
         """计算投料子优先级 PRi。
 
         ``BL`` 表示瓶颈前允许积压的工作量目标（单位与 load 相同）；
@@ -529,9 +613,10 @@ class DynamicDBR:
         """
         if BL <= 0:
             raise ValueError("BL must be greater than zero.")
-        load = self.get_bottleneck_queue_load(
-            state,
-            mbottleneck,
+        load = (
+            self.get_bottleneck_queue_load(state, mbottleneck)
+            if queue_load is None
+            else queue_load
         )
         return r * (1.0 - load / BL)
 
@@ -672,17 +757,22 @@ class DynamicDBR:
         if self.main_bottleneck is None:
             return decision
 
-        # 优化：一次决策内所有候选共享同一份操作排队工作量，只在进入 decide 时
-        # 汇总一次（cal_Bi 查表）；设备产能是静态的，永久缓存在
-        # ``_operation_capacity_cache``。
-        self._operation_buffers = self._build_operation_buffer(state)
+        # 无可派工设备且没有投料机会时，策略不可能产生动作。定时瓶颈更新已在
+        # 上方处理完毕，因此无需为这个空决策扫描全部 WIP、计算 layer load 或
+        # buffer。全量仿真中这类调用约占一半。
+        if not state.dispatchable_tools and not state.release_opportunity:
+            return decision
 
-        # 当前时刻所有候选共用一份 Layer Load（依赖当前 WIP，每次决策重算；
-        # build_layer_list 已按产品缓存，因此这里只是轻量的逐 lot 查表）。
-        layer_loads = self.get_layer_load(
-            self.main_bottleneck,
-            state.wafers,
+        # layer load、operation buffer 与瓶颈前队列都依赖当前 WIP；一次扫描
+        # 同时汇总，避免每个决策重复遍历 WIP。
+        (
+            layer_loads,
+            self._operation_buffers,
+            self._bottleneck_queue_load,
+        ) = self._build_wip_indexes(
+            state, self.main_bottleneck
         )
+        self._layer_loads = layer_loads
 
         #  PRi大于0 则放入新的lot。
         if state.release_opportunity and state.waiting_lot_count > 0:
@@ -692,6 +782,7 @@ class DynamicDBR:
                     self.main_bottleneck,
                     self.parameters["BL"],
                     self.parameters["r"],
+                    self._bottleneck_queue_load,
                 )
                 > 0
             )

@@ -88,15 +88,7 @@ def _print_progress(current_time: float, total_time: float) -> None:
         print()
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the fab model from SQLite.")
-    parser.add_argument("--model-database", type=Path, default=DEFAULT_MODEL_DATABASE)
-    parser.add_argument("--strategy", default="FIFO")
-    parser.add_argument("--strategy-params", type=Path)
-    parser.add_argument("--order-seed", type=int, default=2026061700)
-    parser.add_argument("--result-database", type=Path, default=DEFAULT_RESULT_DATABASE)
-    args = parser.parse_args()
-
+def _run(args: argparse.Namespace) -> None:
     # 优化：记录仿真的墙钟运行时长，供进度条与结果入库使用。
     run_started_at = time.perf_counter()
     result = run_simulation_from_database(
@@ -122,18 +114,34 @@ def main() -> None:
     print(f"Saved run {run_id} to {args.result_database}")
 
 
-if __name__ == "__main__":
-    # 优化：添加cProfile以便优化策略/内核性能
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Run the fab model from SQLite.")
+    parser.add_argument("--model-database", type=Path, default=DEFAULT_MODEL_DATABASE)
+    parser.add_argument("--strategy", default="FIFO")
+    parser.add_argument("--strategy-params", type=Path)
+    parser.add_argument("--order-seed", type=int, default=2026061700)
+    parser.add_argument("--result-database", type=Path, default=DEFAULT_RESULT_DATABASE)
+    parser.add_argument(
+        "--cprofile",
+        action="store_true",
+        help="启用 cProfile，并在运行结束后打印累计耗时统计。",
+    )
+    args = parser.parse_args()
+    if not args.cprofile:
+        _run(args)
+        return
+
     import cProfile
     import pstats
 
     profiler = cProfile.Profile()
     profiler.enable()
+    try:
+        _run(args)
+    finally:
+        profiler.disable()
+        pstats.Stats(profiler).sort_stats("cumulative").print_stats(50)
 
+
+if __name__ == "__main__":
     main()
-
-    profiler.disable()
-
-    stats = pstats.Stats(profiler)
-    stats.sort_stats("cumulative")
-    stats.print_stats(50)

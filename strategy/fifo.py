@@ -10,6 +10,7 @@ class FIFOStrategy(FabStrategy):
     """订单池按 FIFO 投料；每台空闲设备按 FIFO 选择可加工 lot。"""
 
     name = "FIFO"
+    requires_available_tools = False
 
     def initialize(self, _: FabModel) -> None:
         """FIFO 不需要预计算工厂参数。"""
