@@ -16,8 +16,8 @@ CREATE TABLE IF NOT EXISTS operations (
     step INTEGER, start_time REAL, end_time REAL, duration REAL
 );
 CREATE TABLE IF NOT EXISTS lots (
-    run_id INTEGER, lot_id TEXT, product_id TEXT, release_time REAL,
-    end_time REAL, completed INTEGER, step INTEGER
+    run_id INTEGER, lot_id TEXT, product_id TEXT, generation_time REAL,
+    release_time REAL, due_time REAL, end_time REAL, completed INTEGER, step INTEGER
 );
 CREATE TABLE IF NOT EXISTS metrics (run_id INTEGER, name TEXT, value REAL);
 CREATE TABLE IF NOT EXISTS cqt_violations (run_id INTEGER, lot_id TEXT, target_step INTEGER, time REAL);
@@ -42,6 +42,15 @@ def save_simulation_result(result: dict[str, object], database_path: Path) -> in
         }
         if "elapsed_seconds" not in columns:
             connection.execute("ALTER TABLE runs ADD COLUMN elapsed_seconds REAL")
+        lot_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(lots)").fetchall()
+        }
+        for column, sql_type in (
+            ("generation_time", "REAL"),
+            ("due_time", "REAL"),
+        ):
+            if column not in lot_columns:
+                connection.execute(f"ALTER TABLE lots ADD COLUMN {column} {sql_type}")
         cursor = connection.execute(
             "INSERT INTO runs(strategy, elapsed_seconds) VALUES (?, ?)",
             (result["strategy"], result.get("elapsed_seconds")),
@@ -67,13 +76,20 @@ def save_simulation_result(result: dict[str, object], database_path: Path) -> in
             ],  # type: ignore[index]
         )
         connection.executemany(
-            "INSERT INTO lots VALUES (?, ?, ?, ?, ?, ?, ?)",
+            """
+            INSERT INTO lots (
+                run_id, lot_id, product_id, generation_time, release_time,
+                due_time, end_time, completed, step
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
             [
                 (
                     run_id,
                     row["id"],
                     row["product_id"],
+                    row["generation_time"],
                     row["release_time"],
+                    row["due_time"],
                     row["end_time"],
                     int(row["completed"]),
                     row["step"],

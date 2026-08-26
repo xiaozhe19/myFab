@@ -18,7 +18,12 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True, help="SMT2020 .xlsx 文件")
     parser.add_argument("--database", type=Path, default=DEFAULT_MODEL_DATABASE, help="目标 SQLite 原始数据文件")
     parser.add_argument("--end-time", type=float, required=True, help="仿真结束时刻（minute）")
-    parser.add_argument("--release-interval", type=float, required=True, help="策略投料决策间隔（minute）")
+    parser.add_argument(
+        "--release-interval",
+        type=float,
+        default=120.0,
+        help="策略投料决策间隔（minute，默认 120）",
+    )
     parser.add_argument("--start-time", type=float, default=0.0, help="仿真开始时刻（minute）")
     parser.add_argument("--warmup-time", type=float, default=0.0, help="warm-up 时长（minute）")
     parser.add_argument("--replace", action="store_true", help="显式重建已有模型库")

@@ -210,7 +210,8 @@ class SyntheticOrderSpec:
 class SimulationSpec:
     start_time: float
     end_time: float
-    release_interval: float
+    # 默认每 120 分钟提供一次投料决策机会，约等于每天最多 12 个 lot。
+    release_interval: float = 120.0
     warmup_time: float = 0.0
 
 

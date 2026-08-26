@@ -6,6 +6,7 @@ import argparse
 import importlib
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -50,16 +51,30 @@ def run_simulation_from_database(
     model_database: Path,
     order_seed: int,
     strategy_params_path: Path | None = None,
+    release_interval: float | None = None,
     progress_callback: Callable[[float, float], None] | None = None,
+    record_decision_log: bool = False,
 ) -> dict[str, object]:
     """从 SQLite 模型库运行任一已接入策略。"""
 
     model = load_fab_model_from_sqlite(model_database)
+    if release_interval is not None:
+        if release_interval <= 0:
+            raise ValueError("release_interval 必须大于 0。")
+        # 校准投料节拍时不改写原始模型库，保证每次试验的配置可追溯。
+        model = replace(
+            model,
+            simulation=replace(
+                model.simulation,
+                release_interval=release_interval,
+            ),
+        )
     strategy = build_strategy(strategy_spec, _load_json_object(strategy_params_path))
     return FabEngine(
         model,
         order_seed=order_seed,
         progress_callback=progress_callback,
+        record_decision_log=record_decision_log,
     ).run(strategy)
 
 
@@ -96,7 +111,9 @@ def _run(args: argparse.Namespace) -> None:
         args.model_database,
         args.order_seed,
         args.strategy_params,
+        args.release_interval,
         progress_callback=_print_progress,
+        record_decision_log=args.record_decision_log,
     )
     elapsed_seconds = time.perf_counter() - run_started_at
     # 优化：把运行时长写入结果字典，metrics_sqlite 会一并存入 runs 表。
@@ -106,9 +123,10 @@ def _run(args: argparse.Namespace) -> None:
     print(
         f"{result['strategy']} finished: "
         f"throughput {measurement['throughput']}, "
-        f"movements {measurement['movements']}, "
-        f"MCT P95 {measurement['mct_p95']}, "
         f"average WIP {measurement['average_fab_wip']}, "
+        f"end-to-end CT P95 {measurement['p95_end_to_end_cycle_time']}, "
+        f"on-time rate {measurement['on_time_rate']:.1%}, "
+        f"release-pool lots {measurement['release_pool_lots_at_end']}, "
         f"elapsed {result['elapsed_seconds']:.1f}s."
     )
     print(f"Saved run {run_id} to {args.result_database}")
@@ -120,7 +138,17 @@ def main() -> None:
     parser.add_argument("--strategy", default="FIFO")
     parser.add_argument("--strategy-params", type=Path)
     parser.add_argument("--order-seed", type=int, default=2026061700)
+    parser.add_argument(
+        "--release-interval",
+        type=float,
+        help="覆盖模型库中的投料决策间隔（minute）；用于校准，不改写模型库。",
+    )
     parser.add_argument("--result-database", type=Path, default=DEFAULT_RESULT_DATABASE)
+    parser.add_argument(
+        "--record-decision-log",
+        action="store_true",
+        help="保存每次策略决策的诊断日志（仅调试时启用，会显著增加运行时间和结果库体积）。",
+    )
     parser.add_argument(
         "--cprofile",
         action="store_true",

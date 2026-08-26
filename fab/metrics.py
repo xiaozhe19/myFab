@@ -57,7 +57,11 @@ class MetricsCollector:
         )
 
     def result(
-        self, strategy: str, lots: list[LotState], tools: dict[str, ToolState]
+        self,
+        strategy: str,
+        lots: list[LotState],
+        tools: dict[str, ToolState],
+        release_pool_lots_at_end: int,
     ) -> dict[str, object]:
         self.advance_time(self.model.simulation.end_time, lots)
         start = self.model.simulation.start_time + self.model.simulation.warmup_time
@@ -65,11 +69,17 @@ class MetricsCollector:
         completed = [
             lot for lot in lots if lot.end_time is not None and lot.end_time >= start
         ]
-        cycle_times = [
-            lot.end_time - lot.release_time
+        end_to_end_cycle_times = [
+            lot.end_time - lot.generation_time
             for lot in completed
             if lot.end_time is not None
         ]
+        completed_with_due_date = [lot for lot in completed if lot.due_time is not None]
+        on_time_count = sum(
+            lot.end_time <= lot.due_time
+            for lot in completed_with_due_date
+            if lot.end_time is not None and lot.due_time is not None
+        )
         return {
             "strategy": strategy,
             "factory_id": self.model.id,
@@ -82,20 +92,20 @@ class MetricsCollector:
             ],
             "measurement": {
                 "throughput": len(completed),
-                "movements": len(self.operations),
-                "mct_average": (
-                    round(sum(cycle_times) / len(cycle_times), 3)
-                    if cycle_times
-                    else 0.0
-                ),
-                "mct_p95": (
-                    round(self._percentile(cycle_times, 0.95), 3)
-                    if cycle_times
-                    else 0.0
-                ),
                 "average_fab_wip": (
                     round(self._wip_area / horizon, 3) if horizon else 0.0
                 ),
+                "p95_end_to_end_cycle_time": (
+                    round(self._percentile(end_to_end_cycle_times, 0.95), 3)
+                    if end_to_end_cycle_times
+                    else 0.0
+                ),
+                "on_time_rate": (
+                    round(on_time_count / len(completed_with_due_date), 6)
+                    if completed_with_due_date
+                    else 0.0
+                ),
+                "release_pool_lots_at_end": release_pool_lots_at_end,
             },
         }
 
@@ -104,7 +114,9 @@ class MetricsCollector:
         return {
             "id": lot.id,
             "product_id": lot.product_id,
+            "generation_time": lot.generation_time,
             "release_time": lot.release_time,
+            "due_time": lot.due_time,
             "end_time": lot.end_time,
             "completed": lot.completed,
             "step": lot.operation_index,

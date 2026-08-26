@@ -33,6 +33,11 @@ class StrategyState:
     # (available_time, tool_id) 排序。策略派工时应优先遍历此列表，避免每次
     # 决策对全部可用设备（约 1400 台）做无意义遍历与排序。
     dispatchable_tools: tuple[ToolState, ...] = ()
+    # 决策轨迹只用于调试和回放；正式批量运行可关闭，避免每个事件构造大量 JSON。
+    record_diagnostics: bool = True
+    # 本轮状态更新涉及的 lot。策略可据此增量维护其内部 WIP 索引；未声明使用
+    # 该字段的第三方策略仍可继续读取完整 lots 快照。
+    changed_lots: tuple[LotState, ...] = ()
 
     @property
     def wafers(self) -> tuple[LotState, ...]:

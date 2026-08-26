@@ -222,21 +222,17 @@ Dynamic DBR 是当前项目中较核心的策略。其思想和实现主要参�
 
 ## 8. 输出指标
 
-项目会记录仿真过程中的生产事件，并输出多个评价指标，包括：
+项目的正式 benchmark 输出五项紧凑指标：
 
-- `throughput`：总完成量；
-- `moves`：总工序移动次数；
-- `mean_cycle_time`：平均生产周期；
-- `avg_wip`：平均在制品数量；
-- `setup_count`：换型次数；
-- `downtime_count`：设备故障次数；
-- 设备事件记录；
-- Lot 加工历史；
-- 工序完成记录。
+- `throughput`：预热期后完成的 Lot 数；
+- `average_fab_wip`：预热期后的平均产线内 WIP；
+- `p95_end_to_end_cycle_time`：订单从到达 release pool 到完成的 P95 周期；
+- `on_time_rate`：有交期的已完成 Lot 中按期完成的比例；
+- `release_pool_lots_at_end`：仿真结束时仍未放行到产线的 Lot 数。
 
-这些指标可以用于比较不同调度策略的表现。
+最后一项用来识别策略通过长期 hold 订单而掩盖 WIP 或交期问题的情况。
 
-例如，一个策略可能产出更高，但 WIP 也更高；另一个策略可能周期时间更短，但设备利用率较低。因此需要综合多个指标判断策略优劣。
+完整性能优化说明见 [仿真提速说明（第六轮）](docs/performance_optimization_round6.md)。
 
 ---
 

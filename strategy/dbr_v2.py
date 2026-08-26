@@ -43,6 +43,10 @@ class DynamicDBR:
         self.last_main_bottleneck_update = None
         self.last_sub_bottleneck_update = None
         self.timers_started = False
+        # 新 lot 通过 Rope gate 后，在其首次派工前保留 PR 加分。
+        # 这对应论文中“release and process a new lot”的同一决策语义。
+        self._release_priority_bonus_lot_id = None
+        self._release_priority_bonus = 0.0
 
     def initialize(self, model: FabModel):
         """由 Engine 在每次仿真开始时调用一次。"""
@@ -78,9 +82,20 @@ class DynamicDBR:
         self._operation_buffers: dict[tuple[str, int], float] = {}
         self._layer_loads: dict[int, float] = {}
         self._bottleneck_queue_load = 0.0
+        self._wip_index_bottleneck: str | None = None
+        self._wip_contributions: dict[
+            str,
+            tuple[int | None, float, tuple[str, int] | None, float, float],
+        ] = {}
         # 产能是同工艺设备长期平均可用率之和，按本 DBR 定义不随瞬时故障改变，
         # 所以在 initialize 中一次求好即可。
         self._operation_capacity_cache: dict[str, float] = {}
+        # (主瓶颈工艺, 产品, lot wafer 数) -> 从每一步开始的剩余主瓶颈工作量。
+        # 值只依赖静态路线和 lot 大小，可跨决策缓存。
+        self._remaining_bottleneck_work_cache: dict[
+            tuple[str, str, int], tuple[float, ...]
+        ] = {}
+        self._setup_time_by_transition: dict[tuple[str, str], float] = {}
         for product_id, product in model.products.items():
             visits: dict[str, int] = {}
             keys: list[tuple[str, int]] = []
@@ -93,10 +108,17 @@ class DynamicDBR:
                 self._operation_capacity_cache.get(spec.process, 0.0)
                 + self.machine_availability[spec.id]
             )
+        for transition in model.setup_transitions:
+            self._setup_time_by_transition.setdefault(
+                (transition.current_setup, transition.new_setup),
+                transition.setup_time.mean,
+            )
         self.previous_BDm = {process: 0.0 for process in self.process_names}
         self.main_bottleneck = None
         self.sub_bottleneck = None
         self.timers_started = False
+        self._release_priority_bonus_lot_id = None
+        self._release_priority_bonus = 0.0
 
     def _build_layers_for_product(self, mbottleneck: str, product_id: str):
         """构建并缓存一个产品在指定主瓶颈下的 Layer 结构。"""
@@ -429,8 +451,105 @@ class DynamicDBR:
             process_time = float(wafer.route[step].process_time)
             buffers[operation_key] = buffers.get(operation_key, 0.0) + process_time
             if operation_key[0] == mbottleneck:
-                bottleneck_queue_load += process_time
+                bottleneck_queue_load += self._effective_queue_load(
+                    wafer, wafer.route[step]
+                )
         return layer_loads, buffers, bottleneck_queue_load
+
+    def _wip_contribution(self, wafer, mbottleneck, current_time):
+        """返回一个 lot 对 DBR 三个动态索引的当前贡献。"""
+
+        step = wafer.operation_index
+        if step >= len(wafer.route):
+            return None, 0.0, None, 0.0, 0.0
+
+        layer_key = (mbottleneck, wafer.product_id)
+        layer_by_step = self._layer_by_step.get(layer_key)
+        if layer_by_step is None:
+            self._build_layers_for_product(*layer_key)
+            layer_by_step = self._layer_by_step[layer_key]
+        layer = layer_by_step[step]
+        layer_weight = (
+            self._layer_load_weight[layer_key].get(layer, 0.0)
+            if layer is not None
+            else 0.0
+        )
+        if wafer.in_process or wafer.ready_time > current_time:
+            return layer, layer_weight, None, 0.0, 0.0
+
+        operation_key = self._operation_keys_by_product[wafer.product_id][step]
+        process_time = float(wafer.route[step].process_time)
+        bottleneck_work = (
+            self._effective_queue_load(wafer, wafer.route[step])
+            if operation_key[0] == mbottleneck
+            else 0.0
+        )
+        return layer, layer_weight, operation_key, process_time, bottleneck_work
+
+    @staticmethod
+    def _effective_queue_load(wafer, step):
+        """估算一个 lot 在当前工步占用的设备时间（分钟）。
+
+        仅用于 DBR 的主瓶颈放料 gate：wafer 工步按实际 wafer 数换算，
+        batch 工步按名义满炉容量平均分摊。引擎加工和 DBR 派工排序不变。
+        """
+
+        process_time = float(step.process_time)
+        unit = step.processing_unit.lower()
+        if unit == "wafer":
+            return process_time * wafer.wafer_count
+        if unit == "batch" and step.batch_maximum is not None:
+            lots_per_batch = max(1, step.batch_maximum // wafer.wafer_count)
+            return process_time / lots_per_batch
+        return process_time
+
+    def _apply_wip_contribution(self, contribution, direction):
+        layer, layer_weight, operation_key, process_time, bottleneck_work = contribution
+        if layer is not None and layer_weight:
+            updated = self._layer_loads.get(layer, 0.0) + direction * layer_weight
+            if updated:
+                self._layer_loads[layer] = updated
+            else:
+                self._layer_loads.pop(layer, None)
+        if operation_key is not None and process_time:
+            updated = (
+                self._operation_buffers.get(operation_key, 0.0)
+                + direction * process_time
+            )
+            if updated:
+                self._operation_buffers[operation_key] = updated
+            else:
+                self._operation_buffers.pop(operation_key, None)
+        self._bottleneck_queue_load += direction * bottleneck_work
+
+    def _refresh_wip_indexes(self, state, mbottleneck):
+        """按引擎提供的变更 lot 增量更新 DBR WIP 索引。"""
+
+        if self._wip_index_bottleneck != mbottleneck:
+            self._wip_index_bottleneck = mbottleneck
+            self._operation_buffers = {}
+            self._layer_loads = {}
+            self._bottleneck_queue_load = 0.0
+            self._wip_contributions = {}
+            changed_lots = state.wafers
+        else:
+            changed_lots = state.changed_lots
+
+        for wafer in changed_lots:
+            previous = self._wip_contributions.get(wafer.id)
+            if previous is not None:
+                self._apply_wip_contribution(previous, -1.0)
+            current = self._wip_contribution(
+                wafer, mbottleneck, state.current_time
+            )
+            self._wip_contributions[wafer.id] = current
+            self._apply_wip_contribution(current, 1.0)
+
+        return (
+            self._layer_loads,
+            self._operation_buffers,
+            self._bottleneck_queue_load,
+        )
 
     def _operation_capacity(self, state, process):
         """返回某 process 对应设备的有效产能率。"""
@@ -596,7 +715,7 @@ class DynamicDBR:
         加工时间之和，不含尚未到达主瓶颈的 lot，避免被重入式路线放大。
         """
         return sum(
-            float(wafer.current_process_time or 0.0)
+            self._effective_queue_load(wafer, wafer.current_step)
             for wafer in state.wafers
             if not wafer.completed
             and not wafer.in_process
@@ -604,19 +723,59 @@ class DynamicDBR:
             and wafer.current_process == mbottleneck
         )
 
-    def cal_Pri(self, state, mbottleneck, BL, r, queue_load=None):
+    def _remaining_bottleneck_work_by_step(self, wafer, mbottleneck):
+        """返回 lot 从每个工步开始的剩余主瓶颈工作量。
+
+        论文式 (11) 的 ``sum_{l=j}^J PT_jl`` 是 lot 当前 layer 到最后一次
+        主瓶颈访问的总加工时间。这里将该量按 route 反向预计算，既覆盖尚未
+        到达主瓶颈的 WIP，也覆盖重入后未来的主瓶颈访问。
+        """
+        key = (mbottleneck, wafer.product_id, wafer.wafer_count)
+        cached = self._remaining_bottleneck_work_cache.get(key)
+        if cached is not None:
+            return cached
+
+        route = wafer.route
+        remaining = [0.0] * (len(route) + 1)
+        for step_index in range(len(route) - 1, -1, -1):
+            step = route[step_index]
+            remaining[step_index] = remaining[step_index + 1]
+            if step.process == mbottleneck:
+                remaining[step_index] += self._effective_queue_load(wafer, step)
+        cached = tuple(remaining)
+        self._remaining_bottleneck_work_cache[key] = cached
+        return cached
+
+    def get_remaining_bottleneck_load(self, state, mbottleneck):
+        """计算全厂 WIP 的剩余主瓶颈工作量，作为 Rope 的负荷口径。
+
+        与仅统计主瓶颈前 ready queue 的旧口径不同，所有已 release 且尚未
+        完成的 lot 都会贡献其后续要经过的主瓶颈工作量。正在加工的 lot 也按
+        论文中的名义 PT 计入，避免刚开始加工就从 Rope 负荷中消失。
+        """
+        total = 0.0
+        for wafer in state.wafers:
+            if wafer.completed:
+                continue
+            remaining = self._remaining_bottleneck_work_by_step(
+                wafer, mbottleneck
+            )
+            total += remaining[wafer.operation_index]
+        return total
+
+    def cal_Pri(self, state, mbottleneck, BL, r, bottleneck_load=None):
         """计算投料子优先级 PRi。
 
-        ``BL`` 表示瓶颈前允许积压的工作量目标（单位与 load 相同）；
-        ``load`` 为当前主瓶颈前排队 lot 的加工工作量。PRi > 0 表示
-        瓶颈前积压低于目标，可放行新 lot。
+        ``BL`` 表示全厂 WIP 的剩余主瓶颈工作量目标（单位与 load 相同）；
+        ``load`` 覆盖当前 lot 及其重入后续仍会占用的主瓶颈加工时间。PRi > 0
+        表示该负荷低于目标，允许新 lot 参与投料竞争。
         """
         if BL <= 0:
             raise ValueError("BL must be greater than zero.")
         load = (
-            self.get_bottleneck_queue_load(state, mbottleneck)
-            if queue_load is None
-            else queue_load
+            self.get_remaining_bottleneck_load(state, mbottleneck)
+            if bottleneck_load is None
+            else bottleneck_load
         )
         return r * (1.0 - load / BL)
 
@@ -690,6 +849,124 @@ class DynamicDBR:
             "total": PMi + PNi + PSi + POi + PRi,
         }
 
+    def _compound_priority_total(
+        self,
+        state,
+        wafer,
+        mbottleneck,
+        sbottleneck,
+        layer_loads,
+    ):
+        """快速计算复合优先级总分，和 ``cal_compound_priority`` 公式等价。
+
+        派工仅使用 total；直接访问当前轮索引和静态路线缓存，避免每个候选构造
+        五项诊断字典以及重复的 layer/operation 查找。
+        """
+
+        step = wafer.operation_index
+        route = wafer.route
+        product_id = wafer.product_id
+        process = route[step].process
+        parameters = self.parameters
+        operation_key = self._operation_keys_by_product[product_id][step]
+
+        capacity = self._operation_capacity_cache.get(process, 0.0)
+        Bi = (
+            self._operation_buffers.get(operation_key, 0.0) / capacity
+            if capacity > 0
+            else float("inf")
+        )
+        layer_key = (mbottleneck, product_id)
+        layer_list = self._layer_cache.get(layer_key)
+        if layer_list is None:
+            layer_list = self._build_layers_for_product(*layer_key)
+        layer = self._layer_by_step[layer_key][step]
+
+        if process == mbottleneck:
+            visits = self._bottleneck_visits.get(layer_key)
+            if visits is None:
+                visit = 0
+                values: list[int | None] = []
+                for operation in route:
+                    if operation.process == mbottleneck:
+                        visit += 1
+                        values.append(visit)
+                    else:
+                        values.append(None)
+                visits = tuple(values)
+                self._bottleneck_visits[layer_key] = visits
+            visit = visits[step]
+            Pmi = 0.0
+            if visit is not None:
+                L0 = parameters["L0"]
+                Pmi = parameters["m1"] * (
+                    layer_loads.get(visit, 0.0) / L0 - 1.0
+                ) + parameters["m0"] * Bi
+                if visit < len(layer_list):
+                    Pmi += parameters["m2"] * (
+                        layer_loads.get(visit + 1, 0.0) / L0 - 1.0
+                    )
+            Pni = 0.0
+        else:
+            Pmi = 0.0
+            Pni = parameters["n0"] * Bi
+            if layer is not None:
+                L0 = parameters["L0"]
+                bottleneck_buffer = self._operation_buffers.get(
+                    (mbottleneck, layer), 0.0
+                )
+                bottleneck_capacity = self._operation_capacity_cache.get(
+                    mbottleneck, 0.0
+                )
+                Bnj = (
+                    bottleneck_buffer / bottleneck_capacity
+                    if bottleneck_capacity > 0
+                    else float("inf")
+                )
+                Pni += parameters["n1"] * (
+                    layer_loads.get(layer, 0.0) / L0 - 1.0
+                ) + parameters["n2"] * Bnj
+
+        Psi = 0.0
+        if sbottleneck is not None:
+            if step + 1 < len(route) and route[step + 1].process == sbottleneck:
+                key = self._operation_keys_by_product[product_id][step + 1]
+                capacity = self._operation_capacity_cache.get(key[0], 0.0)
+                buffer = self._operation_buffers.get(key, 0.0)
+                Psi = parameters["s1"] * (
+                    buffer / capacity if capacity > 0 else float("inf")
+                )
+            elif step > 0 and route[step - 1].process == sbottleneck:
+                key = self._operation_keys_by_product[product_id][step - 1]
+                capacity = self._operation_capacity_cache.get(key[0], 0.0)
+                buffer = self._operation_buffers.get(key, 0.0)
+                Psi = parameters["s2"] * (
+                    buffer / capacity if capacity > 0 else float("inf")
+                )
+
+        heartbeat_key = (mbottleneck, id(layer_list))
+        Dt = self._heartbeat_cache.get(heartbeat_key)
+        if Dt is None:
+            bottleneck_capacity = self._operation_capacity_cache.get(mbottleneck, 0.0)
+            Dt = (
+                sum(float(layer["PT"]) for layer in layer_list)
+                / bottleneck_capacity
+                if bottleneck_capacity > 0
+                else float("inf")
+            )
+            self._heartbeat_cache[heartbeat_key] = Dt
+        if not math.isfinite(Dt) or Dt <= 0:
+            Poi = 0.0
+        else:
+            last_completion = state.last_operation_completion.get(operation_key)
+            if last_completion is None:
+                last_completion = state.current_time - Dt
+            Poi = parameters["p1"] * (
+                (state.current_time - last_completion) / Dt - 1.0
+            ) + parameters["p2"] * (step + 1) / len(route)
+
+        return Pmi + Pni + Psi + Poi
+
     def estimate_setup_time(self, tool, lot):
         # 估算换型时间以支持换型惩罚 尽量避免频繁换型
         step = lot.current_step
@@ -698,13 +975,9 @@ class DynamicDBR:
         if step.required_setup == tool.current_setup:
             return 0.0
 
-        matches = [
-            item.setup_time.mean
-            for item in self.model.setup_transitions
-            if item.current_setup == (tool.current_setup or "")
-            and item.new_setup == step.required_setup
-        ]
-        return matches[0] if matches else 0.0
+        return self._setup_time_by_transition.get(
+            (tool.current_setup or "", step.required_setup), 0.0
+        )
 
     def decide(self, state: StrategyState) -> StrategyDecision:
         """
@@ -757,35 +1030,100 @@ class DynamicDBR:
         if self.main_bottleneck is None:
             return decision
 
+        # 即使当前没有可执行的派工/投料，事件仍可能改变某个 lot 的 WIP 贡献。
+        # 先吸收这些增量；否则这轮 state 被引擎消费后，下次实际决策会读到陈旧索引。
+        (
+            layer_loads,
+            self._operation_buffers,
+            self._bottleneck_queue_load,
+        ) = self._refresh_wip_indexes(state, self.main_bottleneck)
+        self._layer_loads = layer_loads
+
         # 无可派工设备且没有投料机会时，策略不可能产生动作。定时瓶颈更新已在
         # 上方处理完毕，因此无需为这个空决策扫描全部 WIP、计算 layer load 或
         # buffer。全量仿真中这类调用约占一半。
         if not state.dispatchable_tools and not state.release_opportunity:
             return decision
 
-        # layer load、operation buffer 与瓶颈前队列都依赖当前 WIP；一次扫描
-        # 同时汇总，避免每个决策重复遍历 WIP。
-        (
-            layer_loads,
-            self._operation_buffers,
-            self._bottleneck_queue_load,
-        ) = self._build_wip_indexes(
-            state, self.main_bottleneck
-        )
-        self._layer_loads = layer_loads
+        priority_cache = {}
 
-        #  PRi大于0 则放入新的lot。
-        if state.release_opportunity and state.waiting_lot_count > 0:
-            decision.release_lot = (
-                self.cal_Pri(
+        def dispatch_score(tool, wafer, bonus=0.0):
+            base = priority_cache.get(wafer.id)
+            if base is None:
+                base = self._compound_priority_total(
                     state,
+                    wafer,
                     self.main_bottleneck,
-                    self.parameters["BL"],
-                    self.parameters["r"],
-                    self._bottleneck_queue_load,
+                    self.sub_bottleneck,
+                    layer_loads,
                 )
-                > 0
+                priority_cache[wafer.id] = base
+            return base + bonus - (
+                self.parameters.get("setup_penalty_weight", 0.0)
+                * self.estimate_setup_time(tool, wafer)
             )
+
+        # Rope：新 lot 必须同时满足剩余主瓶颈负荷低于 BL，且在其首工序
+        # 工具组内不劣于现有候选 lot。release event 的 dispatches 不会被引擎
+        # 执行，因此完成 gate 后立即返回，避免无效的整厂派工计算。
+        if state.release_opportunity:
+            if not state.waiting_lot_count:
+                return decision
+            candidate = state.waiting_lots[0]
+            remaining_load = self.get_remaining_bottleneck_load(
+                state, self.main_bottleneck
+            )
+            pri = self.cal_Pri(
+                state,
+                self.main_bottleneck,
+                self.parameters["BL"],
+                self.parameters["r"],
+                remaining_load,
+            )
+            entry_group = candidate.current_step.tool_group_id
+            entry_tools = [
+                tool
+                for tool in state.dispatchable_tools
+                if self.model.tools[tool.tool_id].tool_group_id == entry_group
+            ]
+            if entry_tools:
+                candidate_score = max(
+                    dispatch_score(tool, candidate, pri) for tool in entry_tools
+                )
+            else:
+                candidate_score = self._compound_priority_total(
+                    state,
+                    candidate,
+                    self.main_bottleneck,
+                    self.sub_bottleneck,
+                    layer_loads,
+                ) + pri
+            best_old_score = float("-inf")
+            competing_count = 0
+            for tool in entry_tools:
+                for wafer in state.eligible_lots_by_tool.get(tool.tool_id, ()):
+                    competing_count += 1
+                    best_old_score = max(best_old_score, dispatch_score(tool, wafer))
+            if pri > 0 and candidate_score >= best_old_score:
+                decision.release_lot = True
+                decision.release_lot_id = candidate.id
+                self._release_priority_bonus_lot_id = candidate.id
+                self._release_priority_bonus = pri
+            if state.record_diagnostics:
+                decision.diagnostics = {
+                    "time": state.current_time,
+                    "main_bottleneck": self.main_bottleneck,
+                    "sub_bottleneck": self.sub_bottleneck,
+                    "remaining_bottleneck_load": remaining_load,
+                    "release_pri": pri,
+                    "release_candidate_id": candidate.id,
+                    "release_candidate_score": candidate_score,
+                    "release_best_old_score": best_old_score,
+                    "release_competing_candidate_count": competing_count,
+                    "release_lot": decision.release_lot,
+                    "release_lot_id": decision.release_lot_id,
+                }
+            return decision
 
         # 对每台空闲机器，从该机器当前可加工的 lot 中选择最高优先级。
         # 优化：遍历引擎预排序的"有候选设备"列表，避免对全部可用设备排序过滤。
@@ -800,18 +1138,13 @@ class DynamicDBR:
                 continue
 
             def priority_key(wafer):
-                compound_priority = self.cal_compound_priority(
-                    state=state,
-                    wafer=wafer,
-                    mbottleneck=self.main_bottleneck,
-                    sbottleneck=self.sub_bottleneck,
-                    layer_loads=layer_loads,
-                )["total"]
-                setup_penalty = self.parameters.get(
-                    "setup_penalty_weight", 0.0
-                ) * self.estimate_setup_time(tool, wafer)
+                release_bonus = (
+                    self._release_priority_bonus
+                    if wafer.id == self._release_priority_bonus_lot_id
+                    else 0.0
+                )
                 return (
-                    compound_priority - setup_penalty,
+                    dispatch_score(tool, wafer, release_bonus),
                     -wafer.ready_time,
                     -wafer.release_time,
                     -wafer.input_order,
@@ -820,21 +1153,29 @@ class DynamicDBR:
             selected = max(candidates, key=priority_key)
             decision.dispatches[tool.tool_id] = selected
             reserved_lot_ids.add(selected.id)
+            if selected.id == self._release_priority_bonus_lot_id:
+                self._release_priority_bonus_lot_id = None
+                self._release_priority_bonus = 0.0
 
         # 记录本次决策的内部参数，供引擎统一落库与事后调试。
-        decision.diagnostics = {
-            "time": state.current_time,
-            "main_bottleneck": self.main_bottleneck,
-            "sub_bottleneck": self.sub_bottleneck,
-            "layer_loads": {
-                str(layer): round(load, 4) for layer, load in layer_loads.items()
-            },
-            "release_lot": decision.release_lot,
-            "release_opportunity": state.release_opportunity,
-            "waiting_lot_count": state.waiting_lot_count,
-            "num_dispatches": len(decision.dispatches),
-            "dispatched_lot_ids": [lot.id for lot in decision.dispatches.values()],
-        }
+        if state.record_diagnostics:
+            decision.diagnostics = {
+                "time": state.current_time,
+                "main_bottleneck": self.main_bottleneck,
+                "sub_bottleneck": self.sub_bottleneck,
+                "layer_loads": {
+                    str(layer): round(load, 4)
+                    for layer, load in layer_loads.items()
+                },
+                "release_lot": decision.release_lot,
+                "release_lot_id": decision.release_lot_id,
+                "release_opportunity": state.release_opportunity,
+                "waiting_lot_count": state.waiting_lot_count,
+                "num_dispatches": len(decision.dispatches),
+                "dispatched_lot_ids": [
+                    lot.id for lot in decision.dispatches.values()
+                ],
+            }
 
         return decision
 

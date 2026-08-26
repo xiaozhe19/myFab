@@ -162,7 +162,8 @@ class ExternalLotReleaseSource:
     """由已导入的 SMT ``LotReleaseSpec`` 生成候选 lot。
 
     每个计划在 ``start_date`` 首次到达，后续到达间隔由其
-    ``release_distribution`` 采样。到达只进入 release pool，不绕过 DBR。
+    ``release_distribution`` 采样。订单到达只进入 release pool；只有
+    ``LOT_RELEASE`` 节拍才会触发策略的投料决策。
     """
 
     def __init__(self, model: FabModel, random_seed: int) -> None:
@@ -186,7 +187,6 @@ class ExternalLotReleaseSource:
             )
             for index, spec in enumerate(self.model.lot_releases)
         )
-        # 保留统一的 DBR 决策节拍：即使没有新的外部计划到达，也能准入池中已有 lot。
         return arrivals + (SourceEvent(start_time, EventKind.LOT_RELEASE, {}),)
 
     def handle_event(
@@ -211,7 +211,9 @@ class ExternalLotReleaseSource:
                 if next_time < end_time
                 else ()
             )
-            return SourceEventResult(events, release_opportunity=True)
+            # 外部订单到达只更新 release pool。若在这里请求投料决策，
+            # FIFO / EDD / CR 会在每次到达时立即放行，投料节拍就失去意义。
+            return SourceEventResult(events)
         if kind is EventKind.LOT_RELEASE:
             next_time = time + release_interval
             events = (
@@ -234,7 +236,11 @@ class ExternalLotReleaseSource:
                     order_id=f"R{index + 1:03d}-{self._release_counts[index]:05d}",
                     generation_time=time,
                     release_time=float("inf"),
-                    due_time=spec.due_date,
+                    due_time=(
+                        time + (spec.due_date - spec.start_date)
+                        if spec.due_date is not None
+                        else None
+                    ),
                     priority=lot_type.priority,
                     route=self.model.products[spec.product_id].route,
                     input_order=self._generated_count,

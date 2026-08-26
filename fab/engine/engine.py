@@ -42,10 +42,12 @@ class FabEngine:
         progress_callback: Callable[[float, float], None] | None = None,
         *,
         batch_from_strategy: bool = False,
+        record_decision_log: bool = False,
     ) -> None:
         if model.time_unit != "minute":
             raise ValueError("FabEngine 只接受以 minute 为规范时间单位的 FabModel。")
         self._batch_from_strategy = batch_from_strategy
+        self._record_decision_log = record_decision_log
         # 策略主动组批的分组（StrategyDecision.batches）；None 表示引擎自主组批。
         self._pending_batches: dict[str, list[LotState]] | None = None
         # 优化：setup 最小连续加工量映射 (current_setup, new_setup) -> minimal_run_length，
@@ -82,6 +84,7 @@ class FabEngine:
             )
         self.lots: list[LotState] = []
         self._lots_by_id: dict[str, LotState] = {}
+        self._changed_lot_ids: set[str] = set()
         # 当前可派工的 lot，按工具组增量维护。列表始终按进入 fab 的顺序，
         # 因而保持旧版扫描 ``self.lots`` 时的候选顺序。
         self._ready_lots_by_group: dict[str, list[LotState]] = {}
@@ -115,6 +118,18 @@ class FabEngine:
             tool_id: spec.tool_group_id or ""
             for tool_id, spec in self.model.tools.items()
         }
+        tool_ids_by_group: dict[str, list[str]] = {}
+        for tool_id, group_id in self._tool_group_by_id.items():
+            tool_ids_by_group.setdefault(group_id, []).append(tool_id)
+        self._tool_ids_by_group = {
+            group_id: tuple(tool_ids)
+            for group_id, tool_ids in tool_ids_by_group.items()
+        }
+        # 候选表只会受某一工具组中的 ready lot 或 idle tool 变化影响。保留上一次
+        # 结果，并在状态变化时仅重建对应工具组，避免每个运输/卸载事件都扫描全厂。
+        self._eligible_lots_cache: dict[str, tuple[LotState, ...]] = {}
+        self._dispatchable_tools_cache: tuple[ToolState, ...] = ()
+        self._candidate_groups_dirty: set[str] = set()
         # 优化：_matching_tools 的匹配结果只依赖静态模型（tools/tool_groups），
         # 与仿真状态无关，缓存后避免每次加工完成时重复扫描全部设备。
         self._matching_tools_cache: dict[tuple[str, str], list[ToolState]] = {}
@@ -290,7 +305,12 @@ class FabEngine:
         if not self._done:
             raise RuntimeError("仿真尚未结束。")
         if self._result is None:
-            self._result = metrics.result(strategy.name, self.lots, self.tool_states)
+            self._result = metrics.result(
+                strategy.name,
+                self.lots,
+                self.tool_states,
+                len(self.order_source.queue),
+            )
             self._result["cqt_violations"] = self.cqt_violations
             self._result["decision_log"] = self._decision_log
         return self._result
@@ -359,6 +379,8 @@ class FabEngine:
     ) -> None:
         """记录一次策略决策及其内部参数，供调试与回放。"""
 
+        if not self._record_decision_log:
+            return
         self._decision_log.append(
             {
                 "time": current_time,
@@ -594,6 +616,7 @@ class FabEngine:
                 del member.dedicated_tools[step.id]
             self._schedule_cqt_deadline(member, step)
             member.operation_index += 1
+            self._changed_lot_ids.add(member.id)
             tool.processed_wafers += member.wafer_count
         tool.current_setup_run_length += 1
         self._schedule_counter_maintenance(tool)
@@ -895,6 +918,12 @@ class FabEngine:
         # 优化：候选表只保留有合法候选 lot 的设备，并预排序，避免策略每次决策
         # 都遍历全部可用设备（约 1400 台）再逐一过滤空候选。
         eligible_by_tool, dispatchable_tools = self._eligible_lots_by_tool()
+        changed_lots = tuple(
+            self._lots_by_id[lot_id]
+            for lot_id in self._changed_lot_ids
+            if lot_id in self._lots_by_id
+        )
+        self._changed_lot_ids.clear()
         return StrategyState(
             self.model,
             self.current_time,
@@ -909,18 +938,30 @@ class FabEngine:
             dict(self._last_operation_completion),
             available_tools=available_tools,
             dispatchable_tools=dispatchable_tools,
+            record_diagnostics=self._record_decision_log,
+            changed_lots=changed_lots,
         )
 
     def _eligible_lots_by_tool(
         self,
     ) -> tuple[dict[str, tuple[LotState, ...]], tuple[ToolState, ...]]:
-        """从 ready 索引构造候选表；同 setup 状态的设备共享候选 tuple。"""
+        """返回增量维护的候选表；同 setup 状态的设备共享候选 tuple。"""
 
-        result: dict[str, tuple[LotState, ...]] = {}
-        dispatchable: list[ToolState] = []
-        for group_id, bucket in self._ready_lots_by_group.items():
+        if not self._candidate_groups_dirty:
+            return self._eligible_lots_cache, self._dispatchable_tools_cache
+
+        # 替换而非原地修改缓存，使已交给策略的 StrategyState 仍保持快照语义。
+        result = dict(self._eligible_lots_cache)
+        for group_id in self._candidate_groups_dirty:
+            for tool_id in self._idle_tools_by_group.get(group_id, ()):
+                result.pop(tool_id, None)
+            # 忙碌的 tool 已经不在 idle 索引中，也可能残留在上一轮候选表中。
+            for tool_id in self._tool_ids_by_group.get(group_id, ()):
+                result.pop(tool_id, None)
+
+            bucket = self._ready_lots_by_group.get(group_id, ())
             tool_ids = self._idle_tools_by_group.get(group_id)
-            if not tool_ids:
+            if not bucket or not tool_ids:
                 continue
             tools = [self.tool_states[tool_id] for tool_id in tool_ids]
             free: list[tuple[LotState, RouteStepSpec]] = []
@@ -954,9 +995,15 @@ class FabEngine:
                     candidates = self._merge_by_lot_order(candidates, own_candidates)
                 if candidates:
                     result[tool.tool_id] = candidates
-                    dispatchable.append(tool)
-        dispatchable.sort(key=lambda tool: (tool.available_time, tool.tool_id))
-        return result, tuple(dispatchable)
+
+        dispatchable = sorted(
+            (self.tool_states[tool_id] for tool_id in result),
+            key=lambda tool: (tool.available_time, tool.tool_id),
+        )
+        self._eligible_lots_cache = result
+        self._dispatchable_tools_cache = tuple(dispatchable)
+        self._candidate_groups_dirty.clear()
+        return result, self._dispatchable_tools_cache
 
     def _is_eligible(self, tool: ToolState, lot: LotState) -> bool:
         """校验单个策略配对，不为此重新扫描所有 lot。"""
@@ -987,8 +1034,11 @@ class FabEngine:
         index = bisect_right(bucket, order, key=lambda item: self._lot_order[item.id])
         bucket.insert(index, lot)
         self._ready_group_by_lot[lot.id] = group_id
+        self._candidate_groups_dirty.add(group_id)
+        self._changed_lot_ids.add(lot.id)
 
     def _remove_ready(self, lot: LotState) -> None:
+        self._changed_lot_ids.add(lot.id)
         group_id = self._ready_group_by_lot.pop(lot.id, None)
         if group_id is None:
             return
@@ -999,6 +1049,7 @@ class FabEngine:
                 break
         if not bucket:
             del self._ready_lots_by_group[group_id]
+        self._candidate_groups_dirty.add(group_id)
 
     def _mark_idle(self, tool: ToolState) -> None:
         if tool.tool_id not in self._idle_tools:
@@ -1007,6 +1058,7 @@ class FabEngine:
         self._idle_tools_by_group.setdefault(
             self._tool_group_by_id[tool.tool_id], set()
         ).add(tool.tool_id)
+        self._candidate_groups_dirty.add(self._tool_group_by_id[tool.tool_id])
 
     def _mark_busy(self, tool: ToolState) -> None:
         if tool.tool_id in self._idle_tools:
@@ -1019,6 +1071,7 @@ class FabEngine:
         tools.discard(tool.tool_id)
         if not tools:
             del self._idle_tools_by_group[group_id]
+        self._candidate_groups_dirty.add(group_id)
 
     def _merge_by_lot_order(
         self, left: tuple[LotState, ...], right: tuple[LotState, ...]

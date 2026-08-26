@@ -16,7 +16,9 @@ class EDD:
         
     def decide(self, state:StrategyState) -> StrategyDecision:
         dispatches: dict[str, object] = {}
-        explanations: dict[str, object] = {}
+        explanations: dict[str, object] | None = (
+            {} if state.record_diagnostics else None
+        )
         reserved_lot_ids : set[str] = set()
 
         #派工，遍历引擎中所有候选的lot并排序
@@ -31,10 +33,11 @@ class EDD:
             selected  = min(candidates, key=self._edd_key)
             dispatches[tool.tool_id] = selected
             reserved_lot_ids.add(selected.id)
-            explanations[tool.tool_id] = {
-                "rule":"按due_time 最早优先。",
-                "selected_due_time": selected.due_time
-            }
+            if explanations is not None:
+                explanations[tool.tool_id] = {
+                    "rule":"按due_time 最早优先。",
+                    "selected_due_time": selected.due_time
+                }
 
         #投料
         release_lot = state.release_opportunity and state.waiting_lot_count >0
@@ -46,7 +49,7 @@ class EDD:
                 "strategy":{"name":self.name,"rule":"EDD"},
                 "release":{"rule":"放行第一个"},
                 "dispatches": explanations
-            },
+            } if state.record_diagnostics else {},
         )
 
     @staticmethod
