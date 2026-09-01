@@ -115,13 +115,16 @@ python -m fab.importer \
 python -m fab.run_model \
   --model-database data/model/hvlm.sqlite \
   --strategy FIFO \
-  --result-database data/result/simulation_results.sqlite
+  --plugin 'fab.plugins.sqlite_storage:SQLiteStoragePlugin={"database_path":"data/result/simulation_results.sqlite"}' \
+  --plugin fab.plugins.trace:TracePlugin \
+  --plugin fab.plugins.results:OnlineMetricsPlugin \
+  --plugin fab.plugins.results:FinalStateSnapshotPlugin
 ```
 
 模型库不保存产品、路线、设备等派生对象，只保存原始 SMT 表；每次运行时在内存中构造
-`FabModel`。结果库按 `run_id` 追加保存 lot、设备、工序记录和聚合 metrics。内核和结果
-库的规范时间单位均为 minute。运行时会显示进度条、百分比及模拟时间进度（当前时间／总
-模拟时长）。
+`FabModel`。启用的结果插件通过 `run_id` 追加保存 lot、设备、工序记录和聚合 metrics。
+内核和结果库的规范时间单位均为 minute。运行时会显示进度条、百分比及模拟时间进度
+（当前时间／总模拟时长）。
 
 ---
 

@@ -11,3 +11,5 @@ data
 data/*
 docs
 docs/*
+tests/*
+tests

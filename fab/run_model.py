@@ -11,13 +11,12 @@ from pathlib import Path
 from typing import Callable
 
 from fab.engine import FabEngine
-from fab.metrics_sqlite import save_simulation_result
 from fab.model import load_fab_model_from_sqlite
 from strategy.fifo import FIFOStrategy
+from fab.plugins import PluginManager,FabPlugin
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL_DATABASE = PROJECT_ROOT / "data" / "model" / "fab_model.sqlite"
-DEFAULT_RESULT_DATABASE = PROJECT_ROOT / "data" / "result" / "simulation_results.sqlite"
 
 
 def _load_json_object(path: Path | None) -> dict[str, object]:
@@ -45,15 +44,59 @@ def build_strategy(spec: str, parameters: dict[str, object] | None = None):
         raise TypeError(f"策略 {spec} 未实现新的 decide(state) 接口。")
     return strategy
 
+def build_plugin(spec: str) -> FabPlugin:
+    class_spec, separator, parameters_text = spec.partition("=")
+    try:
+        module_name, classname = class_spec.split(":", 1)
+    except ValueError as error:
+        raise ValueError(
+            "插件格式必须是 module:class，"
+            "或 module:class={JSON 参数}。"
+        ) from error
+
+    plugin_class = getattr(
+        importlib.import_module(module_name),
+        classname,
+    )
+    parameters: dict[str, object] = {}
+    if separator:
+        try:
+            parameters = json.loads(parameters_text)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"插件 {class_spec} 的参数不是合法 JSON。"
+            ) from error
+        if not isinstance(parameters, dict):
+            raise ValueError(
+                f"插件 {class_spec} 的参数必须是 JSON 对象。"
+            )
+
+    plugin = plugin_class(**parameters)
+
+    if not isinstance(plugin, FabPlugin):
+        raise TypeError(
+            f"插件 {class_spec} 必须继承 FabPlugin。"
+        )
+
+    return plugin
+
+def build_plugin_manager(
+        plugin_spec: list[str]
+) -> PluginManager:
+    plugins = [
+        build_plugin(spec)
+        for spec in plugin_spec
+    ]
+    return PluginManager(plugins)
 
 def run_simulation_from_database(
     strategy_spec: str,
     model_database: Path,
     order_seed: int,
+    plugin_manager:PluginManager,
     strategy_params_path: Path | None = None,
     release_interval: float | None = None,
     progress_callback: Callable[[float, float], None] | None = None,
-    record_decision_log: bool = False,
 ) -> dict[str, object]:
     """从 SQLite 模型库运行任一已接入策略。"""
 
@@ -74,7 +117,7 @@ def run_simulation_from_database(
         model,
         order_seed=order_seed,
         progress_callback=progress_callback,
-        record_decision_log=record_decision_log,
+        plugin_manager=plugin_manager,
     ).run(strategy)
 
 
@@ -104,32 +147,19 @@ def _print_progress(current_time: float, total_time: float) -> None:
 
 
 def _run(args: argparse.Namespace) -> None:
-    # 优化：记录仿真的墙钟运行时长，供进度条与结果入库使用。
+    plugin_manager = build_plugin_manager(args.plugin_specs)
     run_started_at = time.perf_counter()
     result = run_simulation_from_database(
-        args.strategy,
-        args.model_database,
-        args.order_seed,
-        args.strategy_params,
-        args.release_interval,
-        progress_callback=_print_progress,
-        record_decision_log=args.record_decision_log,
+    strategy_spec=args.strategy,
+    model_database=args.model_database,
+    order_seed=args.order_seed,
+    plugin_manager=plugin_manager,
+    strategy_params_path=args.strategy_params,
+    release_interval=args.release_interval,
+    progress_callback=_print_progress,
     )
     elapsed_seconds = time.perf_counter() - run_started_at
-    # 优化：把运行时长写入结果字典，metrics_sqlite 会一并存入 runs 表。
-    result["elapsed_seconds"] = round(elapsed_seconds, 3)
-    run_id = save_simulation_result(result, args.result_database)
-    measurement = result["measurement"]
-    print(
-        f"{result['strategy']} finished: "
-        f"throughput {measurement['throughput']}, "
-        f"average WIP {measurement['average_fab_wip']}, "
-        f"end-to-end CT P95 {measurement['p95_end_to_end_cycle_time']}, "
-        f"on-time rate {measurement['on_time_rate']:.1%}, "
-        f"release-pool lots {measurement['release_pool_lots_at_end']}, "
-        f"elapsed {result['elapsed_seconds']:.1f}s."
-    )
-    print(f"Saved run {run_id} to {args.result_database}")
+    print(f"{result['strategy']} finished in {elapsed_seconds:.1f}s.")
 
 
 def main() -> None:
@@ -143,11 +173,16 @@ def main() -> None:
         type=float,
         help="覆盖模型库中的投料决策间隔（minute）；用于校准，不改写模型库。",
     )
-    parser.add_argument("--result-database", type=Path, default=DEFAULT_RESULT_DATABASE)
     parser.add_argument(
-        "--record-decision-log",
-        action="store_true",
-        help="保存每次策略决策的诊断日志（仅调试时启用，会显著增加运行时间和结果库体积）。",
+        "--plugin",
+        dest="plugin_specs",
+        action="append",
+        default=[],
+        metavar="MODULE:CLASS[=JSON]",
+        help=(
+            "启用一个插件，格式为 module:class 或 "
+            "module:class={JSON 参数}；可重复指定。"
+        ),
     )
     parser.add_argument(
         "--cprofile",

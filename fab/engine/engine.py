@@ -15,7 +15,6 @@ from fab.engine.eligibility import (
     tool_is_available,
 )
 from fab.engine.events import EVENT_PRIORITY, EventKind, SimulationEvent
-from fab.metrics import MetricsCollector
 from fab.model.entities import (
     BreakdownSpec,
     DistributionSpec,
@@ -26,6 +25,7 @@ from fab.model.entities import (
     ToolGroupSpec,
     ToolState,
 )
+from fab.plugins import PluginManager, PluginResultContext
 from fab.order_source import LotSource, create_lot_source
 from fab.strategy import FabStrategy, StrategyDecision, StrategyState
 
@@ -42,12 +42,11 @@ class FabEngine:
         progress_callback: Callable[[float, float], None] | None = None,
         *,
         batch_from_strategy: bool = False,
-        record_decision_log: bool = False,
+        plugin_manager: PluginManager | None=None,
     ) -> None:
         if model.time_unit != "minute":
             raise ValueError("FabEngine 只接受以 minute 为规范时间单位的 FabModel。")
         self._batch_from_strategy = batch_from_strategy
-        self._record_decision_log = record_decision_log
         # 策略主动组批的分组（StrategyDecision.batches）；None 表示引擎自主组批。
         self._pending_batches: dict[str, list[LotState]] | None = None
         # 优化：setup 最小连续加工量映射 (current_setup, new_setup) -> minimal_run_length，
@@ -100,12 +99,9 @@ class FabEngine:
         self._strategy: FabStrategy | None = None
         # 默认保留完整空闲设备快照，确保未声明优化开关的第三方策略完全兼容。
         self._include_available_tools = True
-        self._metrics: MetricsCollector | None = None
         self._pending: StrategyDecision | None = None
         self._done = False
         self._result: dict[str, object] | None = None
-        self.cqt_violations: list[dict[str, object]] = []
-        self._decision_log: list[dict[str, object]] = []
         self._progress_callback = progress_callback
         self._last_progress = -1.0
         # 优化：增量维护"无占用/无故障/无换型"的设备 ID 集合，供 _state 快速构建
@@ -149,6 +145,11 @@ class FabEngine:
             for pm in self.model.preventive_maintenance
             if pm.pm_type == "wafer_count"
         ]
+        self._plugin_manager = (
+            plugin_manager
+            if plugin_manager is not None
+            else PluginManager()
+        )
 
     def schedule(self, time: float, kind: EventKind, **payload: object) -> None:
         """安排未来事件；日历排序由 SimulationEvent 定义。"""
@@ -187,13 +188,14 @@ class FabEngine:
     def begin_episode(self, strategy: FabStrategy) -> None:
         if self._strategy is not None:
             raise RuntimeError("一个引擎实例只能运行一次。")
-        self._strategy, self._metrics = strategy, MetricsCollector(self.model)
+        self._strategy = strategy
         # 内置策略只读取 dispatchable_tools；显式 opt-out 后无需在每轮决策复制
         # 全部空闲设备。未声明该属性的外部策略仍按旧行为获得完整快照。
         self._include_available_tools = bool(
             getattr(strategy, "requires_available_tools", True)
         )
         strategy.initialize(self.model)
+        self._plugin_manager.on_simulation_started(self.model)
         # 优化：初始空闲设备集合 = 初始可用（未占用、未故障、已到可用时刻）的设备。
         for tool in self.tool_states.values():
             if tool_is_available(tool, self.current_time):
@@ -217,14 +219,18 @@ class FabEngine:
     def advance_until_release(self) -> StrategyState | None:
         """推进客观事件，直到下一次需要外部 release 动作的时刻。"""
 
-        strategy, metrics = self._runtime()
+        strategy = self._runtime()
         if self._pending is not None:
             return self._state(True)
 
         while self._calendar:
             self.current_time = self._calendar[0].time
             self._report_progress()
-            metrics.advance_time(self.current_time, self.lots)
+            if self._plugin_manager.has_time_advanced_plugins:
+                self._plugin_manager.on_time_advanced(
+                    self.current_time,
+                    self.lots
+                )
             event_kinds: list[str] = []
             reasons: list[str] = []
             release_opportunity = False
@@ -237,7 +243,7 @@ class FabEngine:
                 event = heapq.heappop(self._calendar)
                 event_kinds.append(event.kind.value)
                 event_release, event_dispatch = self._handle_event(
-                    event, metrics, reasons
+                    event,  reasons
                 )
                 release_opportunity |= event_release
                 dispatch_opportunity |= event_dispatch
@@ -249,15 +255,25 @@ class FabEngine:
             if release_opportunity:
                 state = self._state(True, event_kinds, reasons)
                 decision = strategy.decide(state)
-                self._log_decision(decision, self.current_time, "release")
+                if self._plugin_manager.has_decision_plugins:
+                    self._plugin_manager.on_decision_made(
+                        self.current_time,
+                        "release",
+                        decision,
+                    )
                 self._pending = decision
                 return state
 
             if dispatch_opportunity:
                 # 只有设备或 Lot 真的可能重新进入候选集时才请求策略派工。
                 decision = strategy.decide(self._state(False, event_kinds, reasons))
-                self._log_decision(decision, self.current_time, "dispatch")
-                self._apply_decision(decision, metrics)
+                if self._plugin_manager.has_decision_plugins:
+                    self._plugin_manager.on_decision_made(
+                        self.current_time,
+                        "dispatch",
+                        decision,
+                    )
+                self._apply_decision(decision)
 
         self._done = True
         return None
@@ -265,7 +281,7 @@ class FabEngine:
     def apply_release_action(self, release_lot: bool | None) -> None:
         """执行策略的 release 决定，或由 RL 覆盖该布尔动作。"""
 
-        strategy, metrics = self._runtime()
+        strategy = self._runtime()
         if self._pending is None:
             raise RuntimeError("当前没有投料决策点。")
         decision, self._pending = self._pending, None
@@ -275,7 +291,7 @@ class FabEngine:
                     "定向投料必须由策略返回 lot ID，不能用布尔 RL 动作覆盖。"
                 )
             decision.release_lot = bool(release_lot)
-        self._apply_decision(decision, metrics)
+        self._apply_decision(decision)
         self._schedule_wakeups(decision)
 
         if not decision.release_lot and decision.release_lot_id is None:
@@ -291,32 +307,50 @@ class FabEngine:
         self._lots_by_id[lot.id] = lot
         self._lot_order[lot.id] = len(self.lots)
         self._mark_ready(lot)
-        metrics.lot_released(lot)
+        self._plugin_manager.on_lot_released(self.current_time, lot)
         # 新 Lot 入厂后由策略再次决定派工；引擎不替它选设备或 Lot。
         follow_up = strategy.decide(self._state(False))
-        self._log_decision(follow_up, self.current_time, "follow_up")
+        if self._plugin_manager.has_decision_plugins:
+            self._plugin_manager.on_decision_made(
+                self.current_time,
+                "follow_up",
+                follow_up,
+            )
         if follow_up.release_lot or follow_up.release_lot_id is not None:
             raise ValueError("策略只能在 LOT_RELEASE 事件中请求投料。")
-        self._apply_decision(follow_up, metrics)
+        self._apply_decision(follow_up)
         self._schedule_wakeups(follow_up)
 
     def finish_episode(self) -> dict[str, object]:
-        strategy, metrics = self._runtime()
+        strategy = self._runtime()
         if not self._done:
             raise RuntimeError("仿真尚未结束。")
         if self._result is None:
-            self._result = metrics.result(
-                strategy.name,
-                self.lots,
-                self.tool_states,
-                len(self.order_source.queue),
+            context = PluginResultContext(
+                strategy_name=strategy.name,
+                model=self.model,
+                lots=self.lots,
+                tools=self.tool_states,
+                release_pool_lots_at_end=len(self.order_source.queue),
             )
-            self._result["cqt_violations"] = self.cqt_violations
-            self._result["decision_log"] = self._decision_log
+            plugin_result = self._plugin_manager.build_result(context)
+            self._result = {
+                "strategy": strategy.name,
+                "factory_id": self.model.id,
+                "time_unit": self.model.time_unit,
+            }
+            duplicated_keys = self._result.keys() & plugin_result.keys()
+            if duplicated_keys:
+                duplicated = ", ".join(sorted(duplicated_keys))
+                raise ValueError(
+                    f"插件不能覆盖 Engine 核心结果字段：{duplicated}。"
+                )
+            self._result.update(plugin_result)
+            self._plugin_manager.on_simulation_finished(context) 
         return self._result
 
     def _handle_event(
-        self, event: SimulationEvent, metrics: MetricsCollector, reasons: list[str]
+        self, event: SimulationEvent, reasons: list[str]
     ) -> tuple[bool, bool]:
         """结算一条客观事件，返回（投料机会，派工机会）。"""
 
@@ -348,9 +382,9 @@ class FabEngine:
         elif kind is EventKind.SETUP_COMPLETE:
             self._after_setup(event)
         elif kind is EventKind.OPERATION_COMPLETE:
-            self._after_operation(event, metrics)
+            self._after_operation(event)
         elif kind is EventKind.UNLOAD_COMPLETE:
-            self._after_unload(event, metrics)
+            self._after_unload(event)
         elif kind is EventKind.TRANSPORT_COMPLETE:
             self._after_transport(event)
         elif kind is EventKind.BREAKDOWN:
@@ -374,24 +408,7 @@ class FabEngine:
             reasons.append("batch_ready")
         return False, dispatch_opportunity
 
-    def _log_decision(
-        self, decision: StrategyDecision, current_time: float, kind: str
-    ) -> None:
-        """记录一次策略决策及其内部参数，供调试与回放。"""
-
-        if not self._record_decision_log:
-            return
-        self._decision_log.append(
-            {
-                "time": current_time,
-                "kind": kind,
-                "diagnostics": dict(decision.diagnostics),
-            }
-        )
-
-    def _apply_decision(
-        self, decision: StrategyDecision, metrics: MetricsCollector
-    ) -> None:
+    def _apply_decision(self, decision: StrategyDecision) -> None:
         """验证策略给出的配对，并启动该配对的物理事件链。"""
 
         self._pending_batches = decision.batches or None
@@ -573,9 +590,7 @@ class FabEngine:
             return True
         return run_length >= self._setup_min_run.get((current_setup, required), 0)
 
-    def _after_operation(
-        self, event: SimulationEvent, metrics: MetricsCollector
-    ) -> None:
+    def _after_operation(self, event: SimulationEvent) -> None:
         tool, lot = self._current_activity(event)
         if tool is None or lot is None:
             return
@@ -591,19 +606,14 @@ class FabEngine:
             - float(active["phase_start"])
         )
         for member in members:
-            metrics.record_operation(
-                member, tool, start, self.current_time, active_duration=worked
-            )
-            member.operation_history.append(
-                {
-                    "step": member.operation_index,
-                    "process": step.process,
-                    "tool_id": tool.tool_id,
-                    "start": start,
-                    "end": self.current_time,
-                    "active_duration": worked,
-                }
-            )
+            if self._plugin_manager.has_operation_plugins:
+                self._plugin_manager.on_operation_completed(
+                    member,
+                    tool,
+                    start,
+                    self.current_time,
+                    worked,
+                )
             operation_key = self._operation_keys_by_product[member.product_id][
                 member.operation_index
             ]
@@ -629,7 +639,7 @@ class FabEngine:
             finished_step=step,
         )
 
-    def _after_unload(self, event: SimulationEvent, metrics: MetricsCollector) -> None:
+    def _after_unload(self, event: SimulationEvent) -> None:
         tool, lot = self._current_activity(event)
         if tool is None or lot is None:
             return
@@ -645,7 +655,7 @@ class FabEngine:
             member.in_process, member.processing_tool_id = False, None
             if member.completed:
                 member.end_time = self.current_time
-                metrics.lot_completed(member)
+                self._plugin_manager.on_lot_completed(self.current_time, member)
                 continue
             if (
                 self.rng.random() < finished_step.rework_probability
@@ -788,13 +798,12 @@ class FabEngine:
         if lot.operation_index < target_index or (
             lot.operation_index == target_index and not lot.in_process
         ):
-            self.cqt_violations.append(
-                {
-                    "lot_id": lot.id,
-                    "target_step": target_index,
-                    "time": self.current_time,
-                }
-            )
+            if self._plugin_manager.has_cqt_plugins:
+                self._plugin_manager.on_cqt_violation(
+                    self.current_time,
+                    lot.id,
+                    target_index,
+                )
 
     def _schedule_transport_for_lot(self, lot_id: str) -> None:
         lot = self._lot(lot_id)
@@ -938,7 +947,7 @@ class FabEngine:
             dict(self._last_operation_completion),
             available_tools=available_tools,
             dispatchable_tools=dispatchable_tools,
-            record_diagnostics=self._record_decision_log,
+            record_diagnostics=self._plugin_manager.has_decision_plugins,
             changed_lots=changed_lots,
         )
 
@@ -1080,10 +1089,10 @@ class FabEngine:
 
         return tuple(sorted((*left, *right), key=lambda lot: self._lot_order[lot.id]))
 
-    def _runtime(self) -> tuple[FabStrategy, MetricsCollector]:
-        if self._strategy is None or self._metrics is None:
+    def _runtime(self) -> FabStrategy:
+        if self._strategy is None:
             raise RuntimeError("请先调用 begin_episode(strategy)。")
-        return self._strategy, self._metrics
+        return self._strategy
 
     def _report_progress(self) -> None:
         if self._progress_callback is None:
