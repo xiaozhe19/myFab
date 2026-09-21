@@ -6,8 +6,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from enum import Enum
+from typing import NamedTuple
 
 
 class EventKind(str, Enum):
@@ -24,6 +24,7 @@ class EventKind(str, Enum):
     OPERATION_COMPLETE = "operation_complete"
     UNLOAD_COMPLETE = "unload_complete"
     TRANSPORT_COMPLETE = "transport_complete"
+    TOOL_AVAILABLE = "tool_available"
 
     # PM 与 Breakdown。
     PM_DUE = "pm_due"
@@ -51,6 +52,7 @@ EVENT_PRIORITY = {
     EventKind.OPERATION_COMPLETE: 10,
     EventKind.UNLOAD_COMPLETE: 10,
     EventKind.TRANSPORT_COMPLETE: 10,
+    EventKind.TOOL_AVAILABLE: 12,
     EventKind.PM_COMPLETE: 15,
     EventKind.REPAIR_COMPLETE: 15,
     EventKind.REWORK_ROUTED: 20,
@@ -65,12 +67,12 @@ EVENT_PRIORITY = {
 }
 
 
-@dataclass(order=True)
-class SimulationEvent:
-    """事件日历中的一条记录。"""
+class SimulationEvent(NamedTuple):
+    """事件日历中的只读记录；使用 tuple 的 C 层字典序比较。"""
 
     time: float
     priority: int
     sequence: int
-    kind: EventKind = field(compare=False)
-    payload: dict[str, object] = field(default_factory=dict, compare=False)
+    kind: EventKind
+    # 引擎调度的事件始终显式传入独立 payload；默认值供简单事件和测试使用。
+    payload: dict[str, object] = {}

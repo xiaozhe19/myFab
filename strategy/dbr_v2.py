@@ -12,9 +12,7 @@ class DynamicDBR:
 
     name = "Dynamic DBR"
     run_id = "dynamic-dbr-v2"
-    # DBR 只使用 Engine 已筛好的 dispatchable_tools，不需要完整空闲设备快照。
-    requires_available_tools = False
-
+    # DBR 只使用 Engine 已筛好的 dispatchable_candidates，不需要完整空闲设备快照。
     def __init__(
         self,
         parameters,
@@ -230,7 +228,7 @@ class DynamicDBR:
 
     def get_mbottolneck(self, state, window=720):
         """返回主瓶颈、负荷率、各工序需求和各工序产能。"""
-        lots = state.waiting_list.queue
+        lots = state.waiting_lots
 
         product_demand = {}
         for lot in lots:
@@ -239,7 +237,7 @@ class DynamicDBR:
             )
 
         machine_groups = {}
-        for machine in state.machines:
+        for machine in state.tool_states.values():
             machine_groups.setdefault(machine.type, []).append(machine)
 
         Dm_list = {}
@@ -251,7 +249,7 @@ class DynamicDBR:
             for product_id, demand in product_demand.items():
                 process_time = sum(
                     step.process_time
-                    for step in state.products[product_id]["route"]
+                    for step in state.model.products[product_id].route
                     if step.process == process
                 )
                 Dm += demand * process_time
@@ -277,14 +275,16 @@ class DynamicDBR:
         """计算某个工作站组的瞬时瓶颈度。"""
         window = self.sub_bottleneck_window
         process_machines = [
-            machine for machine in state.machines if machine.type == process
+            machine
+            for machine in state.tool_states.values()
+            if machine.type == process
         ]
         if not process_machines:
             return 0.0
 
         QLm = sum(
             float(wafer.current_process_time or 0.0)
-            for wafer in state.wafers
+            for wafer in state.lots
             if not wafer.completed
             and not wafer.in_process
             and wafer.ready_time <= state.current_time
@@ -295,7 +295,9 @@ class DynamicDBR:
 
     def get_sbottleneck(self, state):
         """使用瞬时瓶颈度和指数平滑识别次瓶颈。"""
-        processes = list(dict.fromkeys(machine.type for machine in state.machines))
+        processes = list(
+            dict.fromkeys(machine.type for machine in state.tool_states.values())
+        )
         BDm_list = {}
         for process in processes:
             IBDm = self.cal_IBD(state, process)
@@ -337,7 +339,7 @@ class DynamicDBR:
         if wafer.completed:
             return None
         for layer in layer_list:
-            if wafer.step <= layer["end_step"]:
+            if wafer.operation_index <= layer["end_step"]:
                 return layer["layer"]
         return None
 
@@ -390,7 +392,7 @@ class DynamicDBR:
     # Operation Buffer
     def get_operation_key(self, wafer, step=None):
         """用 (process, visit_number) 表示多产品环境中的操作 i。"""
-        step = wafer.step if step is None else step
+        step = wafer.operation_index if step is None else step
         if step < 0 or step >= len(wafer.route):
             return None
         return self._operation_keys_by_product[wafer.product_id][step]
@@ -398,14 +400,14 @@ class DynamicDBR:
     def _build_operation_buffer(self, state):
         """按 operation_key 汇总各操作前排队 lot 的加工工作量。
 
-        优化：cal_Bi 原本对每个调用点都全量扫描 state.wafers 并按路线前缀统计
+        优化：cal_Bi 原本对每个调用点都全量扫描 state.lots 并按路线前缀统计
         visit_number（随 WIP 与路线长度放大）。同一时刻所有候选中，等待某个
         operation 的 lot 集合相同，因此这里一次性按 operation_key 分组求和，
         之后的 cal_Bi 直接查表。
         """
         current_time = state.current_time
         buffers: dict[tuple[str, int], float] = {}
-        for wafer in state.wafers:
+        for wafer in state.lots:
             step = wafer.operation_index
             if (
                 step >= len(wafer.route)
@@ -430,7 +432,7 @@ class DynamicDBR:
         buffers: dict[tuple[str, int], float] = {}
         layer_loads: dict[int, float] = {}
         bottleneck_queue_load = 0.0
-        for wafer in state.wafers:
+        for wafer in state.lots:
             step = wafer.operation_index
             if step >= len(wafer.route):
                 continue
@@ -531,7 +533,7 @@ class DynamicDBR:
             self._layer_loads = {}
             self._bottleneck_queue_load = 0.0
             self._wip_contributions = {}
-            changed_lots = state.wafers
+            changed_lots = state.lots
         else:
             changed_lots = state.changed_lots
 
@@ -586,7 +588,7 @@ class DynamicDBR:
         step=None,
     ):
         """返回指定 step 是第几次主瓶颈访问。"""
-        step = wafer.step if step is None else step
+        step = wafer.operation_index if step is None else step
         if step < 0 or step >= len(wafer.route):
             return None
         key = (mbottleneck, wafer.product_id)
@@ -667,8 +669,8 @@ class DynamicDBR:
         """计算次瓶颈相邻操作子优先级 PSi。"""
         if sbottleneck is None:
             return 0.0
-        next_step = wafer.step + 1
-        previous_step = wafer.step - 1
+        next_step = wafer.operation_index + 1
+        previous_step = wafer.operation_index - 1
 
         if (
             next_step < len(wafer.route)
@@ -701,7 +703,7 @@ class DynamicDBR:
             # 首次加工时让 Drum 偏差项初始化为 0。
             ti = state.current_time - Dt
         return p1 * ((state.current_time - ti) / Dt - 1.0) + p2 * (
-            wafer.step + 1
+            wafer.operation_index + 1
         ) / len(wafer.route)
 
     def get_bottleneck_queue_load(
@@ -716,7 +718,7 @@ class DynamicDBR:
         """
         return sum(
             self._effective_queue_load(wafer, wafer.current_step)
-            for wafer in state.wafers
+            for wafer in state.lots
             if not wafer.completed
             and not wafer.in_process
             and wafer.ready_time <= state.current_time
@@ -754,7 +756,7 @@ class DynamicDBR:
         论文中的名义 PT 计入，避免刚开始加工就从 Rope 负荷中消失。
         """
         total = 0.0
-        for wafer in state.wafers:
+        for wafer in state.lots:
             if wafer.completed:
                 continue
             remaining = self._remaining_bottleneck_work_by_step(
@@ -792,7 +794,7 @@ class DynamicDBR:
         """计算五项子优先级及总优先级。"""
         parameters = self.parameters if parameters is None else parameters
         layer_loads = (
-            self.get_layer_load(mbottleneck, state.wafers)
+            self.get_layer_load(mbottleneck, state.lots)
             if layer_loads is None
             else layer_loads
         )
@@ -1042,7 +1044,7 @@ class DynamicDBR:
         # 无可派工设备且没有投料机会时，策略不可能产生动作。定时瓶颈更新已在
         # 上方处理完毕，因此无需为这个空决策扫描全部 WIP、计算 layer load 或
         # buffer。全量仿真中这类调用约占一半。
-        if not state.dispatchable_tools and not state.release_opportunity:
+        if not state.dispatchable_candidates and not state.release_opportunity:
             return decision
 
         priority_cache = {}
@@ -1081,14 +1083,15 @@ class DynamicDBR:
                 remaining_load,
             )
             entry_group = candidate.current_step.tool_group_id
-            entry_tools = [
-                tool
-                for tool in state.dispatchable_tools
+            entry_candidates = [
+                (tool, candidates)
+                for tool, candidates in state.dispatchable_candidates
                 if self.model.tools[tool.tool_id].tool_group_id == entry_group
             ]
-            if entry_tools:
+            if entry_candidates:
                 candidate_score = max(
-                    dispatch_score(tool, candidate, pri) for tool in entry_tools
+                    dispatch_score(tool, candidate, pri)
+                    for tool, _ in entry_candidates
                 )
             else:
                 candidate_score = self._compound_priority_total(
@@ -1100,8 +1103,8 @@ class DynamicDBR:
                 ) + pri
             best_old_score = float("-inf")
             competing_count = 0
-            for tool in entry_tools:
-                for wafer in state.eligible_lots_by_tool.get(tool.tool_id, ()):
+            for tool, candidates in entry_candidates:
+                for wafer in candidates:
                     competing_count += 1
                     best_old_score = max(best_old_score, dispatch_score(tool, wafer))
             if pri > 0 and candidate_score >= best_old_score:
@@ -1126,12 +1129,12 @@ class DynamicDBR:
             return decision
 
         # 对每台空闲机器，从该机器当前可加工的 lot 中选择最高优先级。
-        # 优化：遍历引擎预排序的"有候选设备"列表，避免对全部可用设备排序过滤。
+        # 遍历引擎预排序的设备与候选 Lot 配对。
         reserved_lot_ids = set()
-        for tool in state.dispatchable_tools:
+        for tool, eligible_candidates in state.dispatchable_candidates:
             candidates = [
                 lot
-                for lot in state.eligible_lots_by_tool.get(tool.tool_id, ())
+                for lot in eligible_candidates
                 if lot.id not in reserved_lot_ids
             ]
             if not candidates:

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import SimpleNamespace
-from typing import Protocol
+from typing import Protocol, TypeAlias
 
 from fab.model.entities import FabModel, LotState, ToolState
+
+DispatchableCandidate: TypeAlias = tuple[ToolState, tuple[LotState, ...]]
 
 
 @dataclass(frozen=True)
@@ -22,47 +23,17 @@ class StrategyState:
     release_opportunity: bool
     event_kinds: tuple[str, ...] = ()
     strategy_reasons: tuple[str, ...] = ()
-    # 引擎按硬约束计算的候选集合；策略只负责从中选择，不负责重新扫描全部 Lot。
-    eligible_lots_by_tool: dict[str, tuple[LotState, ...]] = field(default_factory=dict)
     # (process, visit_number) -> 最近一次该工序访问完成的模拟时刻。
     last_operation_completion: dict[tuple[str, int], float] = field(
         default_factory=dict
     )
-    available_tools: tuple[ToolState, ...] = ()
-    # 优化：引擎预计算"当前至少有一个合法候选 lot"的设备，已按
-    # (available_time, tool_id) 排序。策略派工时应优先遍历此列表，避免每次
-    # 决策对全部可用设备（约 1400 台）做无意义遍历与排序。
-    dispatchable_tools: tuple[ToolState, ...] = ()
+    # 已按 (available_time, tool_id) 排序的设备及其合法候选 Lot。
+    dispatchable_candidates: tuple[DispatchableCandidate, ...] = ()
     # 决策轨迹只用于调试和回放；正式批量运行可关闭，避免每个事件构造大量 JSON。
     record_diagnostics: bool = True
     # 本轮状态更新涉及的 lot。策略可据此增量维护其内部 WIP 索引；未声明使用
     # 该字段的第三方策略仍可继续读取完整 lots 快照。
     changed_lots: tuple[LotState, ...] = ()
-
-    @property
-    def wafers(self) -> tuple[LotState, ...]:
-        """DBR/RL 使用的真实 lot 集合。"""
-        return self.lots
-
-    @property
-    def machines(self) -> tuple[ToolState, ...]:
-        return tuple(self.tool_states.values())
-
-    @property
-    def waiting_list(self) -> SimpleNamespace:
-        return SimpleNamespace(queue=self.waiting_lots)
-
-    @property
-    def products(self) -> dict[str, dict[str, object]]:
-        return {
-            product.id: {
-                "id": product.id,
-                "name": product.name,
-                "route": product.route,
-            }
-            for product in self.model.products.values()
-        }
-
 
 @dataclass
 class StrategyDecision:
@@ -79,14 +50,6 @@ class StrategyDecision:
     wakeups: list[tuple[float, str]] = field(default_factory=list)
     # 策略可选地写入决策解释；引擎只保存，不参与算法或动作校验。
     diagnostics: dict[str, object] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class StrategyWakeup:
-    """策略请求未来再次决策的时间点。"""
-
-    time: float
-    reason: str
 
 
 class FabStrategy(Protocol):

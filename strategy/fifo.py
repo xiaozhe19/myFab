@@ -10,8 +10,6 @@ class FIFOStrategy(FabStrategy):
     """订单池按 FIFO 投料；每台空闲设备按 FIFO 选择可加工 lot。"""
 
     name = "FIFO"
-    requires_available_tools = False
-
     def initialize(self, _: FabModel) -> None:
         """FIFO 不需要预计算工厂参数。"""
 
@@ -21,12 +19,11 @@ class FIFOStrategy(FabStrategy):
             {} if state.record_diagnostics else None
         )
         reserved_lot_ids: set[str] = set()
-        # 优化：引擎已按 (available_time, tool_id) 预排序好"有候选设备"列表，
-        # 无需再对全部可用设备排序与过滤。
-        for tool in state.dispatchable_tools:
+        # 引擎直接提供按稳定顺序排列的设备及其合法候选 Lot。
+        for tool, eligible_candidates in state.dispatchable_candidates:
             candidates = [
                 lot
-                for lot in state.eligible_lots_by_tool.get(tool.tool_id, ())
+                for lot in eligible_candidates
                 if lot.id not in reserved_lot_ids
             ]
             if not candidates:

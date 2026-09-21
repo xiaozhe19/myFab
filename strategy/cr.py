@@ -11,8 +11,6 @@ class CriticalRatio:
 
     name = "CR"
     run_id = "critical_ratio"
-    requires_available_tools = False
-
     def initialize(self, model: FabModel) -> None:
         self.model = model
         # (product_id, wafer_count) -> suffix work table. Entry i is the
@@ -103,10 +101,10 @@ class CriticalRatio:
             cr, _ = cr_and_work(lot)
             return (cr, *self._tie_break_key(lot))
 
-        for tool in state.dispatchable_tools:
+        for tool, eligible_candidates in state.dispatchable_candidates:
             candidates = [
                 lot
-                for lot in state.eligible_lots_by_tool.get(tool.tool_id, ())
+                for lot in eligible_candidates
                 if lot.id not in reserved_lot_ids
             ]
             if not candidates:

@@ -158,7 +158,22 @@ def _derive_products(
         route_name = _required(row, "ROUTE NAME")
         if route_name not in routes:
             raise ValueError(f"产品 {product_id} 引用了不存在的路线 {route_name}。")
-        products.setdefault(product_id, ProductSpec(product_id, product_id, routes[route_name], route_name))
+        part_family = (
+            _text(row.get("PARTFAM"))
+            or _text(row.get("PART FAMILY"))
+            or _text(row.get("PART FAMILY NAME"))
+            or product_id
+        )
+        products.setdefault(
+            product_id,
+            ProductSpec(
+                product_id,
+                product_id,
+                routes[route_name],
+                route_name,
+                part_family,
+            ),
+        )
     return products
 
 

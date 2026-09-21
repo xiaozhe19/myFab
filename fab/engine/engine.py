@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import heapq
 import random
+import re
 from bisect import bisect_right
+from collections import deque
 from itertools import count
 from typing import Callable
 
@@ -27,7 +29,13 @@ from fab.model.entities import (
 )
 from fab.plugins import PluginManager, PluginResultContext
 from fab.order_source import LotSource, create_lot_source
-from fab.strategy import FabStrategy, StrategyDecision, StrategyState
+from fab.sampling import sample_duration, sample_duration_sum
+from fab.strategy import (
+    DispatchableCandidate,
+    FabStrategy,
+    StrategyDecision,
+    StrategyState,
+)
 
 
 class FabEngine:
@@ -42,7 +50,7 @@ class FabEngine:
         progress_callback: Callable[[float, float], None] | None = None,
         *,
         batch_from_strategy: bool = False,
-        plugin_manager: PluginManager | None=None,
+        plugin_manager: PluginManager | None = None,
     ) -> None:
         if model.time_unit != "minute":
             raise ValueError("FabEngine 只接受以 minute 为规范时间单位的 FabModel。")
@@ -55,23 +63,44 @@ class FabEngine:
             (t.current_setup, t.new_setup): t.minimal_run_length
             for t in model.setup_transitions
         }
+        self._setup_transition_by_pair = {}
+        for transition in model.setup_transitions:
+            self._setup_transition_by_pair.setdefault(
+                (transition.current_setup, transition.new_setup), transition
+            )
         self.model = model
         # 事件日历和 ToolState.available_time 必须使用同一精度。否则两者只差
         # 极小浮点误差时，空闲索引会认为设备可派工，而最终合法性校验会拒绝它。
         self.current_time = self._time(model.simulation.start_time)
         self.rng = random.Random(order_seed)
-        self.tool_states = {
-            spec.id: ToolState(
-                spec.id, spec.name, spec.process, self._time(spec.available_from)
+        self.tool_states: dict[str, ToolState] = {}
+        for spec in model.tools.values():
+            group = model.tool_groups.get(spec.tool_group_id or "")
+            capacity = (
+                max(1, group.cascading_capacity)
+                if group is not None and group.cascading_tool
+                else 1
             )
-            for spec in model.tools.values()
-        }
+            self.tool_states[spec.id] = ToolState(
+                spec.id,
+                spec.name,
+                spec.process,
+                self._time(spec.available_from),
+                capacity=capacity,
+            )
         # (process, visit) 只由路线决定；预计算可避免每次完工都扫描路线前缀来
         # 计算该工艺是产品路线中的第几次访问。
         self._operation_keys_by_product = {
             product_id: self._operation_keys(product.route)
             for product_id, product in model.products.items()
         }
+        self._route_step_index_by_product: dict[str, dict[str, int]] = {}
+        for product_id, product in model.products.items():
+            indexes: dict[str, int] = {}
+            for index, step in enumerate(product.route):
+                if step.id is not None:
+                    indexes.setdefault(step.id, index)
+            self._route_step_index_by_product[product_id] = indexes
         self._transport_by_location: dict[
             tuple[str | None, str | None], DistributionSpec
         ] = {}
@@ -93,23 +122,27 @@ class FabEngine:
         self._calendar: list[SimulationEvent] = []
         self._sequence = count()
         self._tokens: dict[str, int] = {tool_id: 0 for tool_id in self.tool_states}
-        self._active: dict[str, dict[str, object]] = {}
-        self._paused: dict[str, dict[str, object]] = {}
+        self._active: dict[tuple[str, int], dict[str, object]] = {}
+        self._paused: dict[str, list[dict[str, object]]] = {}
+        self._scheduled_tool_available: set[tuple[str, float]] = set()
+        # 同一设备可能在维修期间再次收到 PM/故障事件。不能丢弃这些事件，
+        # 而是按到达顺序逐项停机，全部完成后再恢复被中断的加工。
+        self._pending_downtimes: dict[
+            str, deque[tuple[SimulationEvent, EventKind]]
+        ] = {}
+        self._pending_pms: dict[str, deque[SimulationEvent]] = {}
         self._last_operation_completion: dict[tuple[str, int], float] = {}
         self._strategy: FabStrategy | None = None
-        # 默认保留完整空闲设备快照，确保未声明优化开关的第三方策略完全兼容。
-        self._include_available_tools = True
         self._pending: StrategyDecision | None = None
+        # ready lot 或 idle tool 的出现意味着合法派工动作可能增加。这个标记只
+        # 表示需要询问策略，不代表引擎替策略选择或执行任何派工动作。
+        self._dispatch_needed = False
         self._done = False
         self._result: dict[str, object] | None = None
         self._progress_callback = progress_callback
         self._last_progress = -1.0
-        # 优化：增量维护"无占用/无故障/无换型"的设备 ID 集合，供 _state 快速构建
-        # available_tools，避免每次决策都扫描全部 1443 台设备（原热点 tool_is_available
-        # 被调用数百万次）。只在设备状态转变的关键点增删集合。
-        self._idle_tools: set[str] = set()
+        # 增量维护空闲设备 ID；派工候选索引据此只重建发生变化的工具组。
         self._idle_tools_by_group: dict[str, set[str]] = {}
-        self._available_tools_cache: tuple[ToolState, ...] | None = None
         self._tool_group_by_id = {
             tool_id: spec.tool_group_id or ""
             for tool_id, spec in self.model.tools.items()
@@ -123,32 +156,44 @@ class FabEngine:
         }
         # 候选表只会受某一工具组中的 ready lot 或 idle tool 变化影响。保留上一次
         # 结果，并在状态变化时仅重建对应工具组，避免每个运输/卸载事件都扫描全厂。
-        self._eligible_lots_cache: dict[str, tuple[LotState, ...]] = {}
-        self._dispatchable_tools_cache: tuple[ToolState, ...] = ()
+        self._eligible_lots_by_group: dict[str, dict[str, tuple[LotState, ...]]] = {}
+        self._dispatchable_candidates_cache: tuple[DispatchableCandidate, ...] = ()
         self._candidate_groups_dirty: set[str] = set()
         # 优化：_matching_tools 的匹配结果只依赖静态模型（tools/tool_groups），
         # 与仿真状态无关，缓存后避免每次加工完成时重复扫描全部设备。
         self._matching_tools_cache: dict[tuple[str, str], list[ToolState]] = {}
-        # 优化：wafer_count 型 PM 只在设备累计加工量达标时触发，且匹配的设备集合
-        # 是静态的。预计算 (pm, 设备列表) 对，避免每次操作完成时遍历全部 PM 规则
-        # 并反复调用 _matching_tools（原热点 _schedule_counter_maintenance）。
-        self._counter_pm_matches: list[tuple[PreventiveMaintenanceSpec, set[str]]] = [
-            (
-                pm,
-                # 优化：用设备 ID 集合做 O(1) 成员判断，避免每次操作后对设备列表线性查找。
-                # 注意 ToolState 是可变 dataclass（不可哈希），因此按 tool_id 存集合。
-                {
-                    tool.tool_id
-                    for tool in self._matching_tools(pm.valid_for_type, pm.type_name)
-                },
-            )
-            for pm in self.model.preventive_maintenance
-            if pm.pm_type == "wafer_count"
-        ]
+        self._breakdowns_by_name: dict[str, BreakdownSpec] = {}
+        for breakdown in self.model.breakdowns:
+            self._breakdowns_by_name.setdefault(breakdown.event_name, breakdown)
+        self._pms_by_name: dict[str, PreventiveMaintenanceSpec] = {}
+        for pm in self.model.preventive_maintenance:
+            self._pms_by_name.setdefault(pm.event_name, pm)
+        # wafer-count PM 的适用范围是静态的。初始化时反向建立 tool -> PM 规则
+        # 索引，使每次工序完成后只检查当前设备自己的规则。
+        counter_pms_by_tool: dict[str, list[PreventiveMaintenanceSpec]] = {}
+        for pm in self.model.preventive_maintenance:
+            if pm.pm_type != "wafer_count":
+                continue
+            for tool in self._matching_tools(pm.valid_for_type, pm.type_name):
+                counter_pms_by_tool.setdefault(tool.tool_id, []).append(pm)
+        self._counter_pms_by_tool: dict[str, tuple[PreventiveMaintenanceSpec, ...]] = {
+            tool_id: tuple(rules) for tool_id, rules in counter_pms_by_tool.items()
+        }
+        # processed_wafers 保留为永不归零的累计量。每条 PM 规则独立保存
+        # 下一个触发阈值，避免短周期 PM 把长周期 PM 的计数清掉。
+        self._next_counter_pm: dict[tuple[str, str], float] = {}
+        for tool_id, rules in self._counter_pms_by_tool.items():
+            for pm in rules:
+                first = sample_duration(
+                    self.rng,
+                    pm.first_one_at_distribution,
+                    pm.first_one_at
+                    if pm.first_one_at is not None
+                    else pm.mean_time_before_pm,
+                )
+                self._next_counter_pm[(tool_id, pm.event_name)] = first
         self._plugin_manager = (
-            plugin_manager
-            if plugin_manager is not None
-            else PluginManager()
+            plugin_manager if plugin_manager is not None else PluginManager()
         )
 
     def schedule(self, time: float, kind: EventKind, **payload: object) -> None:
@@ -189,11 +234,6 @@ class FabEngine:
         if self._strategy is not None:
             raise RuntimeError("一个引擎实例只能运行一次。")
         self._strategy = strategy
-        # 内置策略只读取 dispatchable_tools；显式 opt-out 后无需在每轮决策复制
-        # 全部空闲设备。未声明该属性的外部策略仍按旧行为获得完整快照。
-        self._include_available_tools = bool(
-            getattr(strategy, "requires_available_tools", True)
-        )
         strategy.initialize(self.model)
         self._plugin_manager.on_simulation_started(self.model)
         # 优化：初始空闲设备集合 = 初始可用（未占用、未故障、已到可用时刻）的设备。
@@ -219,7 +259,6 @@ class FabEngine:
     def advance_until_release(self) -> StrategyState | None:
         """推进客观事件，直到下一次需要外部 release 动作的时刻。"""
 
-        strategy = self._runtime()
         if self._pending is not None:
             return self._state(True)
 
@@ -227,14 +266,11 @@ class FabEngine:
             self.current_time = self._calendar[0].time
             self._report_progress()
             if self._plugin_manager.has_time_advanced_plugins:
-                self._plugin_manager.on_time_advanced(
-                    self.current_time,
-                    self.lots
-                )
+                self._plugin_manager.on_time_advanced(self.current_time, self.lots)
             event_kinds: list[str] = []
             reasons: list[str] = []
             release_opportunity = False
-            dispatch_opportunity = False
+            forced_decision = False
             simulation_end = False
 
             # 同一时刻内，新事件（例如 operation -> unload）也必须在
@@ -242,37 +278,38 @@ class FabEngine:
             while self._calendar and self._calendar[0].time == self.current_time:
                 event = heapq.heappop(self._calendar)
                 event_kinds.append(event.kind.value)
-                event_release, event_dispatch = self._handle_event(
-                    event,  reasons
-                )
+                event_release, event_forced = self._handle_event(event, reasons)
                 release_opportunity |= event_release
-                dispatch_opportunity |= event_dispatch
+                forced_decision |= event_forced
                 simulation_end |= event.kind is EventKind.SIMULATION_END
 
             if simulation_end:
                 self._done = True
                 return None
             if release_opportunity:
+                # 投料决策使用的同一份状态也包含当前派工候选，因此同时消费此前
+                # 累积的派工通知；是否真的派工仍完全由策略决定。
+                self._dispatch_needed = False
                 state = self._state(True, event_kinds, reasons)
-                decision = strategy.decide(state)
-                if self._plugin_manager.has_decision_plugins:
-                    self._plugin_manager.on_decision_made(
-                        self.current_time,
-                        "release",
-                        decision,
-                    )
-                self._pending = decision
+                self._pending = self._decide(state, "release")
                 return state
 
-            if dispatch_opportunity:
-                # 只有设备或 Lot 真的可能重新进入候选集时才请求策略派工。
-                decision = strategy.decide(self._state(False, event_kinds, reasons))
-                if self._plugin_manager.has_decision_plugins:
-                    self._plugin_manager.on_decision_made(
-                        self.current_time,
-                        "dispatch",
-                        decision,
-                    )
+            if self._dispatch_needed or forced_decision:
+                # ready/idle 状态变化只说明候选可能增加。先更新候选索引；若确实
+                # 没有合法动作则无需调用策略。显式 wakeup/batch 事件必须调用。
+                dispatchable_candidates = self._candidate_index()
+                self._dispatch_needed = False
+                if not forced_decision and not dispatchable_candidates:
+                    continue
+                decision = self._decide(
+                    self._state(
+                        False,
+                        event_kinds,
+                        reasons,
+                        dispatchable_candidates=dispatchable_candidates,
+                    ),
+                    "dispatch",
+                )
                 self._apply_decision(decision)
 
         self._done = True
@@ -281,7 +318,6 @@ class FabEngine:
     def apply_release_action(self, release_lot: bool | None) -> None:
         """执行策略的 release 决定，或由 RL 覆盖该布尔动作。"""
 
-        strategy = self._runtime()
         if self._pending is None:
             raise RuntimeError("当前没有投料决策点。")
         decision, self._pending = self._pending, None
@@ -306,20 +342,26 @@ class FabEngine:
         self.lots.append(lot)
         self._lots_by_id[lot.id] = lot
         self._lot_order[lot.id] = len(self.lots)
-        self._mark_ready(lot)
         self._plugin_manager.on_lot_released(self.current_time, lot)
+        if self._advance_over_unsampled_steps(lot):
+            self._mark_ready(lot)
+        else:
+            self._complete_lot(lot)
         # 新 Lot 入厂后由策略再次决定派工；引擎不替它选设备或 Lot。
-        follow_up = strategy.decide(self._state(False))
-        if self._plugin_manager.has_decision_plugins:
-            self._plugin_manager.on_decision_made(
-                self.current_time,
-                "follow_up",
-                follow_up,
-            )
+        self._dispatch_needed = False
+        follow_up = self._decide(self._state(False), "follow_up")
         if follow_up.release_lot or follow_up.release_lot_id is not None:
             raise ValueError("策略只能在 LOT_RELEASE 事件中请求投料。")
         self._apply_decision(follow_up)
         self._schedule_wakeups(follow_up)
+
+    def _decide(self, state: StrategyState, kind: str) -> StrategyDecision:
+        """请求一次策略决策，并统一通知决策观察插件。"""
+
+        decision = self._runtime().decide(state)
+        if self._plugin_manager.has_decision_plugins:
+            self._plugin_manager.on_decision_made(self.current_time, kind, decision)
+        return decision
 
     def finish_episode(self) -> dict[str, object]:
         strategy = self._runtime()
@@ -342,24 +384,18 @@ class FabEngine:
             duplicated_keys = self._result.keys() & plugin_result.keys()
             if duplicated_keys:
                 duplicated = ", ".join(sorted(duplicated_keys))
-                raise ValueError(
-                    f"插件不能覆盖 Engine 核心结果字段：{duplicated}。"
-                )
+                raise ValueError(f"插件不能覆盖 Engine 核心结果字段：{duplicated}。")
             self._result.update(plugin_result)
-            self._plugin_manager.on_simulation_finished(context) 
+            self._plugin_manager.on_simulation_finished(context)
         return self._result
 
     def _handle_event(
         self, event: SimulationEvent, reasons: list[str]
     ) -> tuple[bool, bool]:
-        """结算一条客观事件，返回（投料机会，派工机会）。"""
+        """结算一条客观事件，返回（投料机会，强制策略唤醒）。"""
 
         kind = event.kind
-        dispatch_opportunity = kind in {
-            EventKind.UNLOAD_COMPLETE,
-            EventKind.TRANSPORT_COMPLETE,
-            EventKind.REPAIR_COMPLETE,
-            EventKind.PM_COMPLETE,
+        forced_decision = kind in {
             EventKind.STRATEGY_WAKEUP,
             EventKind.BATCH_READY,
         }
@@ -375,7 +411,7 @@ class FabEngine:
                 self.schedule(next_event.time, next_event.kind, **next_event.payload)
             return (
                 source_result.release_opportunity,
-                dispatch_opportunity or source_result.release_opportunity,
+                forced_decision,
             )
         if kind is EventKind.LOAD_COMPLETE:
             self._after_load(event)
@@ -387,12 +423,17 @@ class FabEngine:
             self._after_unload(event)
         elif kind is EventKind.TRANSPORT_COMPLETE:
             self._after_transport(event)
+        elif kind is EventKind.TOOL_AVAILABLE:
+            tool_id = str(event.payload["tool_id"])
+            self._scheduled_tool_available.discard((tool_id, event.time))
+            tool = self.tool_states[tool_id]
+            self._refresh_tool_capacity(tool)
         elif kind is EventKind.BREAKDOWN:
             self._begin_downtime(event, EventKind.REPAIR_COMPLETE)
         elif kind is EventKind.REPAIR_COMPLETE:
             self._end_downtime(event)
         elif kind is EventKind.PM_DUE:
-            self._begin_downtime(event, EventKind.PM_COMPLETE)
+            self._handle_pm_due(event)
         elif kind is EventKind.PM_COMPLETE:
             self._end_downtime(event)
         elif kind is EventKind.REWORK_ROUTED:
@@ -406,12 +447,15 @@ class FabEngine:
         elif kind is EventKind.BATCH_READY:
             # 批量组成由策略返回的动作决定；引擎只提供此唤醒事件。
             reasons.append("batch_ready")
-        return False, dispatch_opportunity
+        return False, forced_decision
 
     def _apply_decision(self, decision: StrategyDecision) -> None:
         """验证策略给出的配对，并启动该配对的物理事件链。"""
 
-        self._pending_batches = decision.batches or None
+        if decision.batches:
+            if self._pending_batches is None:
+                self._pending_batches = {}
+            self._pending_batches.update(decision.batches)
         assigned: set[str] = set()
         for tool_id, lot in decision.dispatches.items():
             tool = self.tool_states.get(tool_id)
@@ -419,13 +463,15 @@ class FabEngine:
                 raise ValueError(f"非法派工：{lot.id} -> {tool_id}。")
             if not self._is_eligible(tool, lot):
                 raise ValueError(f"非法派工：{lot.id} -> {tool_id}。")
+            step = lot.current_step
+            if step is not None and step.processing_unit == "batch":
+                self._reserve_batch(tool, lot)
             self._remove_ready(lot)
             lot.in_process, lot.processing_tool_id = True, tool_id
             lot.start_time = (
                 lot.start_time if lot.start_time is not None else self.current_time
             )
-            tool.in_process, tool.current_product_id = True, lot.product_id
-            tool.active_lot_id = lot.id
+            tool.current_product_id = lot.product_id
             self._start_phase(
                 tool, lot, EventKind.LOAD_COMPLETE, self._loading_time(tool)
             )
@@ -439,19 +485,27 @@ class FabEngine:
         duration: float,
         *,
         batch_lots: list[LotState] | None = None,
+        activity_token: int | None = None,
+        next_start: float | None = None,
         **payload: object,
     ) -> None:
         """占用设备并安排当前物理阶段的完成事件。batch 工步可传入整炉 lot 列表。"""
 
-        # 优化：设备被占用（加工/换型），从空闲集合移除。
-        self._mark_busy(tool)
-        self._tokens[tool.tool_id] += 1
-        token = self._tokens[tool.tool_id]
         finish = self._time(self.current_time + max(duration, 0.0))
-        tool.available_time = finish
-        tool.is_in_setup = completion is EventKind.SETUP_COMPLETE
+        if activity_token is None:
+            self._tokens[tool.tool_id] += 1
+            token = self._tokens[tool.tool_id]
+            active: dict[str, object] = {}
+        else:
+            token = activity_token
+            active = self._active.get((tool.tool_id, token), {})
+            if not active:
+                raise RuntimeError(
+                    f"设备 {tool.tool_id} 的加工活动 token {token} 已失效。"
+                )
+
         members = batch_lots or [lot]
-        self._active[tool.tool_id] = {
+        active.update({
             "token": token,
             "completion": completion,
             "lot_id": lot.id,
@@ -459,8 +513,16 @@ class FabEngine:
             "finish": finish,
             "phase_start": self.current_time,
             "batch_lots": members,
+            "next_start": self._time(
+                next_start if next_start is not None else finish
+            ),
             **payload,
-        }
+        })
+        self._active[(tool.tool_id, token)] = active
+        tool.active_lot_id = lot.id
+        current_step = lot.current_step
+        tool.active_step_id = current_step.id if current_step else None
+        self._refresh_tool_capacity(tool)
         self.schedule(
             finish,
             completion,
@@ -471,12 +533,13 @@ class FabEngine:
         )
 
     def _after_load(self, event: SimulationEvent) -> None:
-        tool, lot = self._current_activity(event)
-        if tool is None or lot is None:
+        tool, lot, active = self._current_activity(event)
+        if tool is None or lot is None or active is None:
             return
         step = lot.current_step
         if step is None:
             return
+        token = int(active["token"])
         if step.required_setup and step.required_setup != tool.current_setup:
             self._start_phase(
                 tool,
@@ -484,19 +547,35 @@ class FabEngine:
                 EventKind.SETUP_COMPLETE,
                 self._setup_time(tool, step),
                 setup=step.required_setup,
+                activity_token=token,
             )
         else:
-            self._start_process(tool, lot)
+            self._start_process(
+                tool,
+                lot,
+                activity_token=token,
+            )
 
     def _after_setup(self, event: SimulationEvent) -> None:
-        tool, lot = self._current_activity(event)
-        if tool is None or lot is None:
+        tool, lot, active = self._current_activity(event)
+        if tool is None or lot is None or active is None:
             return
         tool.current_setup = str(event.payload["setup"])
         tool.current_setup_run_length = 0
-        self._start_process(tool, lot)
+        self._start_process(
+            tool,
+            lot,
+            activity_token=int(active["token"]),
+        )
 
-    def _start_process(self, tool: ToolState, lot: LotState) -> None:
+    def _start_process(
+        self,
+        tool: ToolState,
+        lot: LotState,
+        *,
+        activity_token: int | None = None,
+        next_start: float | None = None,
+    ) -> None:
         step = lot.current_step
         if step is None:
             raise ValueError("已完成 Lot 不能开始加工。")
@@ -515,19 +594,44 @@ class FabEngine:
                 tool,
                 lot,
                 EventKind.OPERATION_COMPLETE,
-                self._duration(step.processing_distribution, step.process_time),
+                sample_duration(
+                    self.rng, step.processing_distribution, step.process_time
+                ),
                 process_start=self.current_time,
                 step_index=lot.operation_index,
                 worked=0.0,
                 batch_lots=members,
+                activity_token=activity_token,
+                next_start=next_start,
             )
             return
-        # wafer 步：逐片加工，每片独立抽样求和；lot 步：整 lot 一次加工。
+        # wafer 步：普通设备逐片求和；级联设备只有第一片走完整
+        # 加工时间，后续 wafer 按 cascading interval 流水进入。
         n = lot.wafer_count if step.processing_unit == "wafer" else 1
-        duration = sum(
-            self._duration(step.processing_distribution, step.process_time)
-            for _ in range(n)
-        )
+        group = self._tool_group(tool)
+        if (
+            n > 1
+            and group is not None
+            and group.cascading_tool
+            and step.cascading_interval is not None
+        ):
+            duration = sample_duration(
+                self.rng, step.processing_distribution, step.process_time
+            ) + (n - 1) * step.cascading_interval
+        else:
+            duration = sample_duration_sum(
+                self.rng,
+                step.processing_distribution,
+                step.process_time,
+                n,
+            )
+        if (
+            n > 1
+            and group is not None
+            and group.cascading_tool
+            and step.cascading_interval is not None
+        ):
+            next_start = self.current_time + (n - 1) * step.cascading_interval
         self._start_phase(
             tool,
             lot,
@@ -536,6 +640,8 @@ class FabEngine:
             process_start=self.current_time,
             step_index=lot.operation_index,
             worked=0.0,
+            activity_token=activity_token,
+            next_start=next_start,
         )
 
     def _select_batch(self, tool: ToolState, first: LotState) -> list[LotState]:
@@ -545,36 +651,196 @@ class FabEngine:
         batch_maximum 片；策略未提供分组时退化为此规则。
         """
 
-        if not self._batch_from_strategy:
-            return self._gather_batch(tool, first)
-        groups = self._pending_batches or {}
-        for members in groups.values():
-            if first in members:
-                return members
-        return self._gather_batch(tool, first)
+        selected = (self._pending_batches or {}).pop(tool.tool_id, None)
+        if selected is not None:
+            members = selected
+        elif self._batch_from_strategy:
+            raise ValueError(
+                f"策略模式必须为批处理设备 {tool.tool_id} 提供 batches。"
+            )
+        else:
+            members = self._gather_batch(tool, first)
+        self._validate_batch(tool, first, members)
+        return members
+
+    def _reserve_batch(self, tool: ToolState, first: LotState) -> list[LotState]:
+        """在 loading 前冻结批次成员，避免后续派工抢走同批 lot。"""
+
+        if self._pending_batches is None:
+            self._pending_batches = {}
+        selected = self._pending_batches.pop(tool.tool_id, None)
+        if selected is None:
+            if self._batch_from_strategy:
+                raise ValueError(
+                    f"策略模式必须为批处理设备 {tool.tool_id} 提供 batches。"
+                )
+            selected = self._gather_batch(tool, first)
+        self._validate_batch(tool, first, selected)
+        self._pending_batches[tool.tool_id] = selected
+        for member in selected:
+            self._remove_ready(member)
+        return selected
 
     def _gather_batch(self, tool: ToolState, first: LotState) -> list[LotState]:
         """自动收集可同批的 lot（含 first），累计 wafer 不超过 batch_maximum。"""
 
         step = first.current_step
+        if step is None:
+            raise ValueError("已完成 Lot 不能组批。")
         members = [first]
-        wafers = first.wafer_count
+        quantity = self._batch_member_quantity(tool, first)
         cap = step.batch_maximum
         for candidate in self._ready_lots_by_group.get(step.tool_group_id or "", ()):
             if (
                 candidate is first
-                or candidate.route[candidate.operation_index] is not step
+                or not self._same_batch_class(tool, first, candidate)
                 or not self._dedication_allowed_fast(candidate, tool.tool_id)
             ):
                 continue
-            if cap is not None and wafers + candidate.wafer_count > cap:
+            candidate_quantity = self._batch_member_quantity(tool, candidate)
+            if cap is not None and quantity + candidate_quantity > cap:
                 continue
             members.append(candidate)
-            wafers += candidate.wafer_count
+            quantity += candidate_quantity
         return members
+
+    def _same_batch_class(
+        self, tool: ToolState, first: LotState, candidate: LotState
+    ) -> bool:
+        """判断两个 lot 是否满足工具组的组批条件。"""
+
+        first_step = first.current_step
+        candidate_step = candidate.current_step
+        if first_step is None or candidate_step is None:
+            return False
+        if candidate_step.processing_unit != "batch":
+            return False
+        if candidate_step.tool_group_id != first_step.tool_group_id:
+            return False
+        group = self._tool_group(tool)
+        criteria = self._batch_criteria(group)
+        if (
+            criteria["same_product"]
+            and candidate.product_id != first.product_id
+        ):
+            return False
+        if (
+            criteria["same_part_family"]
+            and self._part_family(candidate.product_id)
+            != self._part_family(first.product_id)
+        ):
+            return False
+        if criteria["same_step"]:
+            return candidate_step.id == first_step.id
+        if not any(criteria.values()):
+            # 未声明 criterion 时也不允许把两道不同工艺混在一炉。
+            return candidate_step == first_step
+        return True
+
+    def _batch_member_quantity(self, tool: ToolState, lot: LotState) -> int:
+        """按 Toolgroups.BATCHING UNIT 把单个 lot 换算为组批数量。"""
+
+        group = self._tool_group(tool)
+        unit = (group.batching_unit or "wafer").strip().lower() if group else "wafer"
+        if "wafer" in unit:
+            return lot.wafer_count
+        if "lot" in unit:
+            return 1
+        raise ValueError(f"不支持的组批单位：{group.batching_unit if group else unit}。")
+
+    def _validate_batch(
+        self, tool: ToolState, first: LotState, members: list[LotState]
+    ) -> None:
+        """验证策略/引擎组成的批次满足 SMT2020 物理约束。"""
+
+        if not members or first not in members:
+            raise ValueError(f"设备 {tool.tool_id} 的批次必须包含首个 Lot {first.id}。")
+        if len({member.id for member in members}) != len(members):
+            raise ValueError(f"设备 {tool.tool_id} 的批次中存在重复 Lot。")
+        for member in members:
+            if member is first:
+                continue
+            if (
+                member.in_process
+                or member.completed
+                or member.ready_time > self.current_time
+                or not self._same_batch_class(tool, first, member)
+                or not self._dedication_allowed_fast(member, tool.tool_id)
+            ):
+                raise ValueError(
+                    f"设备 {tool.tool_id} 的批次包含非法 Lot {member.id}。"
+                )
+        step = first.current_step
+        if step is None:
+            raise ValueError("已完成 Lot 不能组批。")
+        quantity = sum(self._batch_member_quantity(tool, member) for member in members)
+        if step.batch_minimum is not None and quantity < step.batch_minimum:
+            raise ValueError(
+                f"设备 {tool.tool_id} 的批次数量 {quantity} "
+                f"低于最小批量 {step.batch_minimum}。"
+            )
+        if step.batch_maximum is not None and quantity > step.batch_maximum:
+            raise ValueError(
+                f"设备 {tool.tool_id} 的批次数量 {quantity} "
+                f"超过最大批量 {step.batch_maximum}。"
+            )
+
+    def _batch_minimum_reached(self, tool: ToolState, lot: LotState) -> bool:
+        step = lot.current_step
+        if step is None or step.processing_unit != "batch":
+            return True
+        if step.batch_minimum is None:
+            return True
+        members = self._gather_batch(tool, lot)
+        quantity = sum(self._batch_member_quantity(tool, member) for member in members)
+        return quantity >= step.batch_minimum
+
+    def _batch_class_key(self, tool: ToolState, lot: LotState) -> tuple[object, ...]:
+        """返回一炉内必须相同的静态属性。"""
+
+        step = lot.current_step
+        if step is None:
+            return (None,)
+        group = self._tool_group(tool)
+        criteria = self._batch_criteria(group)
+        key: list[object] = [step.tool_group_id]
+        if criteria["same_product"]:
+            key.append(lot.product_id)
+        if criteria["same_part_family"]:
+            key.append(self._part_family(lot.product_id))
+        if criteria["same_step"]:
+            key.append(step.id)
+        elif not any(criteria.values()):
+            key.append(step)
+        return tuple(key)
+
+    @staticmethod
+    def _batch_criteria(group: ToolGroupSpec | None) -> dict[str, bool]:
+        criterion = (group.batch_criterion or "").lower() if group else ""
+        normalized = re.sub(r"[^a-z0-9]+", "", criterion)
+        return {
+            "same_product": "sameproduct" in normalized,
+            "same_part_family": (
+                "samepartfam" in normalized
+                or "samepartfamily" in normalized
+            ),
+            "same_step": (
+                "samestepname" in normalized
+                or "samestep" in normalized
+            ),
+        }
+
+    def _part_family(self, product_id: str) -> str:
+        product = self.model.products.get(product_id)
+        if product is None:
+            return product_id
+        return product.part_family or product.id
 
     def _dedication_allowed_fast(self, lot: LotState, tool_id: str) -> bool:
         """O(1) LTL 判断：当前工步若是进行中绑定的目标则必须回绑定设备。"""
+        rework_tool = lot.rework_tool_bindings.get(lot.operation_index)
+        if rework_tool is not None:
+            return rework_tool == tool_id
         step = lot.route[lot.operation_index]
         bound = lot.dedicated_tools.get(step.id) if lot.dedicated_tools else None
         return bound is None or bound == tool_id
@@ -591,10 +857,9 @@ class FabEngine:
         return run_length >= self._setup_min_run.get((current_setup, required), 0)
 
     def _after_operation(self, event: SimulationEvent) -> None:
-        tool, lot = self._current_activity(event)
-        if tool is None or lot is None:
+        tool, lot, active = self._current_activity(event)
+        if tool is None or lot is None or active is None:
             return
-        active = self._active[tool.tool_id]
         members = active.get("batch_lots", [lot])
         step = lot.current_step
         if step is None:
@@ -618,6 +883,9 @@ class FabEngine:
                 member.operation_index
             ]
             self._last_operation_completion[operation_key] = self.current_time
+            member.last_tool_group_id = step.tool_group_id
+            member.processed_tool_by_step[member.operation_index] = tool.tool_id
+            member.rework_tool_bindings.pop(member.operation_index, None)
             if step.lot_to_lens_dedication_step:
                 # 绑定工步：把 lot 绑定到当前设备，供 LTL 目标工步（step id）回本机。
                 member.dedicated_tools[step.lot_to_lens_dedication_step] = tool.tool_id
@@ -637,25 +905,23 @@ class FabEngine:
             self._unloading_time(tool),
             batch_lots=members,
             finished_step=step,
+            activity_token=int(active["token"]),
+            next_start=float(active["next_start"]),
         )
 
     def _after_unload(self, event: SimulationEvent) -> None:
-        tool, lot = self._current_activity(event)
-        if tool is None or lot is None:
+        tool, lot, active = self._current_activity(event)
+        if tool is None or lot is None or active is None:
             return
-        active = self._active.pop(tool.tool_id, None)
-        members = active.get("batch_lots", [lot]) if active else [lot]
+        self._active.pop((tool.tool_id, int(active["token"])), None)
+        members = active.get("batch_lots", [lot])
         finished_step = event.payload.get("finished_step")
         if not isinstance(finished_step, RouteStepSpec):
             raise RuntimeError("卸载事件缺少路线工步。")
-        tool.in_process = False
-        tool.is_in_setup = False
-        tool.active_lot_id = None
         for member in members:
             member.in_process, member.processing_tool_id = False, None
             if member.completed:
-                member.end_time = self.current_time
-                self._plugin_manager.on_lot_completed(self.current_time, member)
+                self._complete_lot(member)
                 continue
             if (
                 self.rng.random() < finished_step.rework_probability
@@ -666,16 +932,12 @@ class FabEngine:
                     EventKind.REWORK_ROUTED,
                     lot_id=member.id,
                     step_id=finished_step.rework_step,
-                )
-            elif self.rng.random() <= finished_step.sampling_probability:
-                self.schedule(
-                    self.current_time, EventKind.SAMPLING_DECISION, lot_id=member.id
+                    end_index=member.operation_index - 1,
                 )
             else:
-                self._schedule_transport_for_lot(member.id)
-        # 优化：设备卸载完成变为空闲；若同时没有故障/换型，则重新进入空闲集合。
-        if not tool.is_down:
-            self._mark_idle(tool)
+                self._continue_route(member)
+        self._refresh_tool_capacity(tool)
+        self._start_pending_pm_if_idle(tool)
 
     def _after_transport(self, event: SimulationEvent) -> None:
         lot = self._lot(str(event.payload["lot_id"]))
@@ -685,20 +947,67 @@ class FabEngine:
     def _begin_downtime(self, event: SimulationEvent, completion: EventKind) -> None:
         tool = self.tool_states[str(event.payload["tool_id"])]
         if tool.is_down:
+            self._pending_downtimes.setdefault(tool.tool_id, deque()).append(
+                (event, completion)
+            )
             return
-        # 优化：设备进入故障/维护，从空闲集合移除。
-        self._mark_busy(tool)
-        active = self._active.pop(tool.tool_id, None)
-        if active is not None:
-            self._tokens[tool.tool_id] += 1  # 使原完成事件失效
-            active["remaining"] = max(float(active["finish"]) - self.current_time, 0.0)
+        paused: list[dict[str, object]] = []
+        for key, active in tuple(self._active.items()):
+            if key[0] != tool.tool_id:
+                continue
+            self._active.pop(key, None)
+            active["remaining"] = max(
+                float(active["finish"]) - self.current_time,
+                0.0,
+            )
             if active["completion"] is EventKind.OPERATION_COMPLETE:
                 active["worked"] = (
                     float(active.get("worked", 0.0))
                     + self.current_time
                     - float(active["phase_start"])
                 )
-            self._paused[tool.tool_id] = active
+            paused.append(active)
+        if paused:
+            # 一次停机使该设备所有旧 token 失效。
+            self._tokens[tool.tool_id] += 1
+            self._paused[tool.tool_id] = paused
+        tool.active_count = 0
+        tool.in_process = False
+        tool.active_lot_id = None
+        tool.active_step_id = None
+        self._mark_busy(tool)
+
+        self._start_downtime(tool, event, completion)
+
+    def _handle_pm_due(self, event: SimulationEvent) -> None:
+        """PM 到期后只登记；设备空闲时才真正开始维护。"""
+
+        tool = self.tool_states[str(event.payload["tool_id"])]
+        if tool.is_down or self._tool_has_activities(tool.tool_id):
+            self._pending_pms.setdefault(tool.tool_id, deque()).append(event)
+            return
+        self._begin_downtime(event, EventKind.PM_COMPLETE)
+
+    def _start_pending_pm_if_idle(self, tool: ToolState) -> bool:
+        if tool.is_down or self._tool_has_activities(tool.tool_id):
+            return False
+        pending = self._pending_pms.get(tool.tool_id)
+        if not pending:
+            return False
+        event = pending.popleft()
+        if not pending:
+            del self._pending_pms[tool.tool_id]
+        self._begin_downtime(event, EventKind.PM_COMPLETE)
+        return True
+
+    def _start_downtime(
+        self,
+        tool: ToolState,
+        event: SimulationEvent,
+        completion: EventKind,
+    ) -> None:
+        """启动一项停机；调用方负责保存正在进行的加工。"""
+
         tool.is_down = True
         tool.is_in_setup = False
         tool.down_reason = str(event.payload.get("reason", event.kind.value))
@@ -714,15 +1023,52 @@ class FabEngine:
 
     def _end_downtime(self, event: SimulationEvent) -> None:
         tool = self.tool_states[str(event.payload["tool_id"])]
+        if event.kind is EventKind.REPAIR_COMPLETE and event.payload.get("breakdown"):
+            name = str(event.payload["breakdown"])
+            breakdown = self._breakdowns_by_name[name]
+            self.schedule(
+                self.current_time
+                + sample_duration(self.rng, breakdown.time_to_failure),
+                EventKind.BREAKDOWN,
+                tool_id=tool.tool_id,
+                duration=sample_duration(self.rng, breakdown.time_to_repair),
+                reason=f"breakdown:{name}",
+                breakdown=name,
+            )
+        if event.kind is EventKind.PM_COMPLETE and event.payload.get("pm_event"):
+            name = str(event.payload["pm_event"])
+            pm = self._pms_by_name[name]
+            if pm.pm_type == "time_based":
+                self.schedule(
+                    self.current_time + pm.mean_time_before_pm,
+                    EventKind.PM_DUE,
+                    tool_id=tool.tool_id,
+                    duration=sample_duration(self.rng, pm.repair_distribution),
+                    reason=f"pm:{name}",
+                    pm_event=name,
+                )
+
+        # 当前停机结束后，优先执行维修期间积压的停机。设备只有在队列清空后
+        # 才恢复加工，避免 PM/故障重叠时其中一个事件被静默丢弃。
+        pending = self._pending_downtimes.get(tool.tool_id)
+        if pending:
+            next_event, next_completion = pending.popleft()
+            if not pending:
+                del self._pending_downtimes[tool.tool_id]
+            self._start_downtime(tool, next_event, next_completion)
+            return
+
         tool.is_down = False
         tool.down_reason = None
         tool.available_time = self.current_time
-        paused = self._paused.pop(tool.tool_id, None)
-        if paused is None:
-            tool.in_process = False
-            # 优化：设备恢复且无暂停活动，重新进入空闲集合。
-            self._mark_idle(tool)
-        else:
+        if self._start_pending_pm_if_idle(tool):
+            return
+        paused_activities = self._paused.pop(tool.tool_id, [])
+        if not paused_activities:
+            self._refresh_tool_capacity(tool)
+            return
+
+        for paused in paused_activities:
             lot = self._lot(str(paused["lot_id"]))
             completion = paused["completion"]
             if not isinstance(completion, EventKind):
@@ -739,6 +1085,7 @@ class FabEngine:
                     "finish",
                     "phase_start",
                     "remaining",
+                    "next_start",
                     "batch_lots",
                 }
             }
@@ -750,46 +1097,68 @@ class FabEngine:
                 batch_lots=paused.get("batch_lots"),
                 **payload,
             )
-        if event.kind is EventKind.REPAIR_COMPLETE and event.payload.get("breakdown"):
-            name = str(event.payload["breakdown"])
-            breakdown = next(
-                item for item in self.model.breakdowns if item.event_name == name
-            )
-            self.schedule(
-                self.current_time + self._duration(breakdown.time_to_failure),
-                EventKind.BREAKDOWN,
-                tool_id=tool.tool_id,
-                duration=self._duration(breakdown.time_to_repair),
-                reason=f"breakdown:{name}",
-                breakdown=name,
-            )
-        if event.kind is EventKind.PM_COMPLETE and event.payload.get("pm_event"):
-            name = str(event.payload["pm_event"])
-            pm = next(
-                item
-                for item in self.model.preventive_maintenance
-                if item.event_name == name
-            )
-            if pm.pm_type == "time_based":
-                self.schedule(
-                    self.current_time + pm.mean_time_before_pm,
-                    EventKind.PM_DUE,
-                    tool_id=tool.tool_id,
-                    duration=self._duration(pm.repair_distribution),
-                    reason=f"pm:{name}",
-                    pm_event=name,
-                )
 
     def _route_rework(self, event: SimulationEvent) -> None:
         lot = self._lot(str(event.payload["lot_id"]))
         step_id = str(event.payload["step_id"])
-        target = next(
-            (index for index, step in enumerate(lot.route) if step.id == step_id), None
-        )
+        target = self._route_step_index_by_product[lot.product_id].get(step_id)
         if target is None:
             raise ValueError(f"重工目标 {step_id} 不在 Lot {lot.id} 的路线中。")
+        end_index = int(event.payload.get("end_index", lot.operation_index - 1))
+        if target > end_index:
+            raise ValueError(
+                f"重工目标 {step_id} 不能位于刚完成的工步之后。"
+            )
+        bindings: dict[int, str] = {}
+        for index in range(target, end_index + 1):
+            tool_id = lot.processed_tool_by_step.get(index)
+            # 抽检未命中的工步没有原设备；重走路线时它仍按抽检
+            # 概率决定是否执行。只对上一轮真正加工过的工步绑定原设备。
+            if tool_id is not None:
+                bindings[index] = tool_id
+        lot.rework_tool_bindings = bindings
         lot.operation_index = target
         self._schedule_transport_for_lot(lot.id)
+
+    def _advance_over_unsampled_steps(self, lot: LotState) -> bool:
+        """根据 SMT2020 processing probability 跳过未抽中的工步。
+
+        返工段必须完整重复，因此有返工设备绑定的工步不再抽样。
+        """
+
+        while not lot.completed:
+            if lot.operation_index in lot.rework_tool_bindings:
+                return True
+            step = lot.current_step
+            if step is None:
+                break
+            probability = min(max(step.sampling_probability, 0.0), 1.0)
+            if probability >= 1.0 or (
+                probability > 0.0 and self.rng.random() < probability
+            ):
+                return True
+            if step.id is not None:
+                lot.dedicated_tools.pop(step.id, None)
+            lot.operation_index += 1
+            self._changed_lot_ids.add(lot.id)
+        return False
+
+    def _continue_route(self, lot: LotState) -> None:
+        """卸载后选出下一道实际需要加工的工步。"""
+
+        if self._advance_over_unsampled_steps(lot):
+            self._schedule_transport_for_lot(lot.id)
+        else:
+            self._complete_lot(lot)
+
+    def _complete_lot(self, lot: LotState) -> None:
+        """统一结算 lot 完工，避免抽检跳过路径漏掉完工通知。"""
+
+        if lot.end_time is not None:
+            return
+        lot.end_time = self.current_time
+        self._changed_lot_ids.add(lot.id)
+        self._plugin_manager.on_lot_completed(self.current_time, lot)
 
     def _record_cqt_violation(self, event: SimulationEvent) -> None:
         lot = self._lot(str(event.payload["lot_id"]))
@@ -821,13 +1190,8 @@ class FabEngine:
     def _schedule_cqt_deadline(self, lot: LotState, step: RouteStepSpec) -> None:
         if step.critical_queue_time is None or step.critical_queue_time_step is None:
             return
-        target = next(
-            (
-                index
-                for index, candidate in enumerate(lot.route)
-                if candidate.id == step.critical_queue_time_step
-            ),
-            None,
+        target = self._route_step_index_by_product[lot.product_id].get(
+            step.critical_queue_time_step
         )
         if target is not None:
             self.schedule(
@@ -842,52 +1206,58 @@ class FabEngine:
             if pm.pm_type != "time_based":
                 continue
             for tool in self._matching_tools(pm.valid_for_type, pm.type_name):
-                first = (
+                first = sample_duration(
+                    self.rng,
+                    pm.first_one_at_distribution,
                     pm.first_one_at
                     if pm.first_one_at is not None
-                    else pm.mean_time_before_pm
+                    else pm.mean_time_before_pm,
                 )
                 self.schedule(
                     self.current_time + first,
                     EventKind.PM_DUE,
                     tool_id=tool.tool_id,
-                    duration=self._duration(pm.repair_distribution),
+                    duration=sample_duration(self.rng, pm.repair_distribution),
                     reason=f"pm:{pm.event_name}",
                     pm_event=pm.event_name,
                 )
 
     def _schedule_counter_maintenance(self, tool: ToolState) -> None:
-        # 优化：遍历预计算的 (wafer_count PM, 匹配设备 ID 集合)，只处理与当前设备
-        # 相关的规则，避免每次操作完成时扫描全部 PM 规则。
-        for pm, matched_tool_ids in self._counter_pm_matches:
-            if tool.tool_id not in matched_tool_ids:
-                continue
-            if tool.processed_wafers >= pm.mean_time_before_pm:
-                tool.processed_wafers %= int(pm.mean_time_before_pm)
+        """为当前设备检查并安排已达到计数阈值的 PM。"""
+
+        for pm in self._counter_pms_by_tool.get(tool.tool_id, ()):
+            key = (tool.tool_id, pm.event_name)
+            threshold = self._next_counter_pm[key]
+            while tool.processed_wafers >= threshold:
                 self.schedule(
                     self.current_time,
                     EventKind.PM_DUE,
                     tool_id=tool.tool_id,
-                    duration=self._duration(pm.repair_distribution),
+                    duration=sample_duration(self.rng, pm.repair_distribution),
                     reason=f"pm:{pm.event_name}",
                     pm_event=pm.event_name,
                 )
+                threshold += pm.mean_time_before_pm
+            self._next_counter_pm[key] = threshold
 
     def _schedule_breakdowns(self) -> None:
         for breakdown in self.model.breakdowns:
             for tool in self._matching_tools(
                 breakdown.valid_for_type, breakdown.type_name
             ):
-                first = (
-                    breakdown.first_one_at
-                    if breakdown.first_one_at is not None
-                    else self._duration(breakdown.time_to_failure)
-                )
+                if breakdown.first_one_at_distribution is not None:
+                    first = sample_duration(
+                        self.rng, breakdown.first_one_at_distribution
+                    )
+                elif breakdown.first_one_at is not None:
+                    first = breakdown.first_one_at
+                else:
+                    first = sample_duration(self.rng, breakdown.time_to_failure)
                 self.schedule(
                     self.current_time + first,
                     EventKind.BREAKDOWN,
                     tool_id=tool.tool_id,
-                    duration=self._duration(breakdown.time_to_repair),
+                    duration=sample_duration(self.rng, breakdown.time_to_repair),
                     reason=f"breakdown:{breakdown.event_name}",
                     breakdown=breakdown.event_name,
                 )
@@ -901,32 +1271,94 @@ class FabEngine:
 
     def _current_activity(
         self, event: SimulationEvent
-    ) -> tuple[ToolState | None, LotState | None]:
-        tool = self.tool_states[str(event.payload["tool_id"])]
-        active = self._active.get(tool.tool_id)
-        if active is None or int(event.payload.get("token", -1)) != active["token"]:
-            return None, None
-        return tool, self._lot(str(event.payload["lot_id"]))
+    ) -> tuple[ToolState | None, LotState | None, dict[str, object] | None]:
+        tool_id = str(event.payload["tool_id"])
+        token = int(event.payload.get("token", -1))
+        tool = self.tool_states[tool_id]
+        active = self._active.get((tool_id, token))
+        if active is None:
+            return None, None, None
+        return tool, self._lot(str(event.payload["lot_id"])), active
+
+    def _tool_has_activities(self, tool_id: str) -> bool:
+        return any(key[0] == tool_id for key in self._active)
+
+    def _refresh_tool_capacity(self, tool: ToolState) -> None:
+        """按设备容量和槽位可用时间刷新空闲索引。"""
+
+        activities = [
+            active
+            for (tool_id, _), active in self._active.items()
+            if tool_id == tool.tool_id
+        ]
+        tool.active_count = len(activities)
+        tool.in_process = bool(activities)
+        tool.is_in_setup = any(
+            active.get("completion") is EventKind.SETUP_COMPLETE
+            for active in activities
+        )
+        if activities:
+            tool.active_lot_id = str(activities[-1]["lot_id"])
+        else:
+            tool.active_lot_id = None
+            tool.active_step_id = None
+
+        group = self._tool_group(tool)
+        cascading = bool(group and group.cascading_tool and tool.capacity > 1)
+        if tool.is_down:
+            self._mark_busy(tool)
+            return
+        if not activities:
+            tool.available_time = self.current_time
+            self._mark_idle(tool)
+            return
+
+        next_slot_time = min(
+            float(active.get("next_start", active["finish"]))
+            for active in activities
+        )
+        pre_process_phase = any(
+            active.get("completion")
+            in {EventKind.LOAD_COMPLETE, EventKind.SETUP_COMPLETE}
+            for active in activities
+        )
+        if tool.is_in_setup or pre_process_phase:
+            tool.available_time = next_slot_time
+            self._mark_busy(tool)
+            return
+        if tool.active_count < tool.capacity:
+            tool.available_time = max(self.current_time, next_slot_time)
+        else:
+            tool.available_time = next_slot_time
+
+        if cascading and tool.active_count < tool.capacity:
+            available_at = max(self.current_time, next_slot_time)
+            if available_at > self.current_time:
+                key = (tool.tool_id, available_at)
+                if key not in self._scheduled_tool_available:
+                    self.schedule(
+                        available_at,
+                        EventKind.TOOL_AVAILABLE,
+                        tool_id=tool.tool_id,
+                    )
+                    self._scheduled_tool_available.add(key)
+
+        if tool.active_count < tool.capacity and tool.available_time <= self.current_time:
+            self._mark_idle(tool)
+        else:
+            self._mark_busy(tool)
 
     def _state(
         self,
         release_opportunity: bool,
         event_kinds: list[str] | None = None,
         reasons: list[str] | None = None,
+        dispatchable_candidates: tuple[DispatchableCandidate, ...] | None = None,
     ) -> StrategyState:
-        # 内置策略只使用 dispatchable_tools；只有显式声明需要完整空闲快照的
-        # 策略才构造 available_tools，避免每个决策复制约 1400 台设备引用。
-        available_tools: tuple[ToolState, ...] = ()
-        if self._include_available_tools:
-            available_tools = self._available_tools_cache
-            if available_tools is None:
-                available_tools = tuple(
-                    self.tool_states[tool_id] for tool_id in self._idle_tools
-                )
-                self._available_tools_cache = available_tools
         # 优化：候选表只保留有合法候选 lot 的设备，并预排序，避免策略每次决策
         # 都遍历全部可用设备（约 1400 台）再逐一过滤空候选。
-        eligible_by_tool, dispatchable_tools = self._eligible_lots_by_tool()
+        if dispatchable_candidates is None:
+            dispatchable_candidates = self._candidate_index()
         changed_lots = tuple(
             self._lots_by_id[lot_id]
             for lot_id in self._changed_lot_ids
@@ -934,85 +1366,168 @@ class FabEngine:
         )
         self._changed_lot_ids.clear()
         return StrategyState(
-            self.model,
-            self.current_time,
-            tuple(self.lots),
-            tuple(self.order_source.queue),
-            self.tool_states,
-            len(self.order_source.queue),
-            release_opportunity,
-            tuple(event_kinds or ()),
-            tuple(reasons or ()),
-            eligible_by_tool,
-            dict(self._last_operation_completion),
-            available_tools=available_tools,
-            dispatchable_tools=dispatchable_tools,
+            model=self.model,
+            current_time=self.current_time,
+            lots=tuple(self.lots),
+            waiting_lots=tuple(self.order_source.queue),
+            tool_states=self.tool_states,
+            waiting_lot_count=len(self.order_source.queue),
+            release_opportunity=release_opportunity,
+            event_kinds=tuple(event_kinds or ()),
+            strategy_reasons=tuple(reasons or ()),
+            last_operation_completion=dict(self._last_operation_completion),
+            dispatchable_candidates=dispatchable_candidates,
             record_diagnostics=self._plugin_manager.has_decision_plugins,
             changed_lots=changed_lots,
         )
 
-    def _eligible_lots_by_tool(
+    def _candidate_index(
         self,
-    ) -> tuple[dict[str, tuple[LotState, ...]], tuple[ToolState, ...]]:
-        """返回增量维护的候选表；同 setup 状态的设备共享候选 tuple。"""
-
+    ) -> tuple[DispatchableCandidate, ...]:
+        """更新发生变化的工具组，并返回设备与候选 Lot 配对。"""
         if not self._candidate_groups_dirty:
-            return self._eligible_lots_cache, self._dispatchable_tools_cache
+            return self._dispatchable_candidates_cache
 
-        # 替换而非原地修改缓存，使已交给策略的 StrategyState 仍保持快照语义。
-        result = dict(self._eligible_lots_cache)
         for group_id in self._candidate_groups_dirty:
-            for tool_id in self._idle_tools_by_group.get(group_id, ()):
-                result.pop(tool_id, None)
-            # 忙碌的 tool 已经不在 idle 索引中，也可能残留在上一轮候选表中。
-            for tool_id in self._tool_ids_by_group.get(group_id, ()):
-                result.pop(tool_id, None)
+            self._rebuild_group_candidates(group_id)
 
-            bucket = self._ready_lots_by_group.get(group_id, ())
-            tool_ids = self._idle_tools_by_group.get(group_id)
-            if not bucket or not tool_ids:
-                continue
-            tools = [self.tool_states[tool_id] for tool_id in tool_ids]
-            free: list[tuple[LotState, RouteStepSpec]] = []
-            dedicated: dict[str, list[tuple[LotState, RouteStepSpec]]] = {}
-            for lot in bucket:
-                step = lot.route[lot.operation_index]
-                bound = lot.dedicated_tools.get(step.id) if lot.dedicated_tools else None
-                if bound is None:
-                    free.append((lot, step))
-                elif self._tool_group_by_id.get(bound) == group_id:
-                    dedicated.setdefault(bound, []).append((lot, step))
-
-            shared: dict[tuple[str | None, int], tuple[LotState, ...]] = {}
-            for tool in tools:
-                profile = (tool.current_setup, tool.current_setup_run_length)
-                candidates = shared.get(profile)
-                if candidates is None:
-                    candidates = tuple(
-                        lot
-                        for lot, step in free
-                        if self._setup_allowed(step, *profile)
-                    )
-                    shared[profile] = candidates
-                own = dedicated.get(tool.tool_id, ())
-                if own:
-                    own_candidates = tuple(
-                        lot
-                        for lot, step in own
-                        if self._setup_allowed(step, *profile)
-                    )
-                    candidates = self._merge_by_lot_order(candidates, own_candidates)
-                if candidates:
-                    result[tool.tool_id] = candidates
-
-        dispatchable = sorted(
-            (self.tool_states[tool_id] for tool_id in result),
-            key=lambda tool: (tool.available_time, tool.tool_id),
-        )
-        self._eligible_lots_cache = result
-        self._dispatchable_tools_cache = tuple(dispatchable)
+        self._rebuild_dispatchable_candidates()
         self._candidate_groups_dirty.clear()
-        return result, self._dispatchable_tools_cache
+        return self._dispatchable_candidates_cache
+
+    def _rebuild_group_candidates(self, group_id: str) -> None:
+        """重新计算一个工具组内空闲设备与等待 Lot 的合法匹配。"""
+
+        bucket = self._ready_lots_by_group.get(group_id, ())
+        tool_ids = self._idle_tools_by_group.get(group_id)
+        if not bucket or not tool_ids:
+            self._eligible_lots_by_group.pop(group_id, None)
+            return
+
+        group_candidates: dict[str, tuple[LotState, ...]] = {}
+        tools = [self.tool_states[tool_id] for tool_id in tool_ids]
+        free: list[tuple[LotState, RouteStepSpec]] = []
+        dedicated: dict[str, list[tuple[LotState, RouteStepSpec]]] = {}
+        for lot in bucket:
+            step = lot.route[lot.operation_index]
+            bound = lot.rework_tool_bindings.get(lot.operation_index)
+            if bound is None and lot.dedicated_tools:
+                bound = lot.dedicated_tools.get(step.id)
+            if bound is None:
+                free.append((lot, step))
+            elif self._tool_group_by_id.get(bound) == group_id:
+                dedicated.setdefault(bound, []).append((lot, step))
+
+        shared: dict[tuple[str | None, int], tuple[LotState, ...]] = {}
+        for tool in tools:
+            profile = (tool.current_setup, tool.current_setup_run_length)
+            candidates = shared.get(profile)
+            if candidates is None:
+                candidates = tuple(
+                    lot
+                    for lot, step in free
+                    if self._setup_allowed(step, *profile)
+                    and self._batch_minimum_reached(tool, lot)
+                )
+                shared[profile] = candidates
+            own = dedicated.get(tool.tool_id, ())
+            if own:
+                own_candidates = tuple(
+                    lot
+                    for lot, step in own
+                    if self._setup_allowed(step, *profile)
+                    and self._batch_minimum_reached(tool, lot)
+                )
+                candidates = self._merge_by_lot_order(candidates, own_candidates)
+            if candidates:
+                group_candidates[tool.tool_id] = candidates
+
+        if group_candidates:
+            group_candidates = self._limit_batch_candidate_tools(
+                group_id, bucket, group_candidates
+            )
+        if group_candidates:
+            self._eligible_lots_by_group[group_id] = group_candidates
+        else:
+            self._eligible_lots_by_group.pop(group_id, None)
+
+    def _limit_batch_candidate_tools(
+        self,
+        group_id: str,
+        bucket: tuple[LotState, ...] | list[LotState],
+        candidates_by_tool: dict[str, tuple[LotState, ...]],
+    ) -> dict[str, tuple[LotState, ...]]:
+        """不向策略暴露超过当前 WIP 能支撑的开炉数量。
+
+        引擎仍不选 lot，只把同一组批类别的合法 lot 放在同一个物理
+        开炉槽中。每炉按现有默认行为尽量装到 batch_maximum。
+        """
+
+        group = self.model.tool_groups.get(group_id)
+        if (
+            group is None
+            or not group.batching_tool
+            or not bucket
+            or any(lot.current_step.processing_unit != "batch" for lot in bucket)
+        ):
+            return candidates_by_tool
+
+        representative_tool = self.tool_states[next(iter(candidates_by_tool))]
+        lots_by_class: dict[tuple[object, ...], list[LotState]] = {}
+        for lot in bucket:
+            lots_by_class.setdefault(
+                self._batch_class_key(representative_tool, lot), []
+            ).append(lot)
+
+        slots: list[tuple[object, ...]] = []
+        classes = sorted(
+            lots_by_class.items(),
+            key=lambda item: min(self._lot_order[lot.id] for lot in item[1]),
+        )
+        for class_key, class_lots in classes:
+            step = class_lots[0].current_step
+            if step is None:
+                continue
+            quantity = sum(
+                self._batch_member_quantity(representative_tool, lot)
+                for lot in class_lots
+            )
+            minimum = step.batch_minimum or 1
+            maximum = step.batch_maximum or quantity
+            while quantity >= minimum:
+                slots.append(class_key)
+                quantity -= min(maximum, quantity)
+
+        remaining_tools = sorted(candidates_by_tool)
+        result: dict[str, tuple[LotState, ...]] = {}
+        for class_key in slots:
+            for tool_id in tuple(remaining_tools):
+                tool = self.tool_states[tool_id]
+                matching = tuple(
+                    lot
+                    for lot in candidates_by_tool[tool_id]
+                    if self._batch_class_key(tool, lot) == class_key
+                )
+                if matching:
+                    result[tool_id] = matching
+                    remaining_tools.remove(tool_id)
+                    break
+            if not remaining_tools:
+                break
+        return result
+
+    def _rebuild_dispatchable_candidates(self) -> None:
+        """按稳定顺序重建设备及其候选 Lot 的配对列表。"""
+
+        dispatchable_candidates = sorted(
+            (
+                (self.tool_states[tool_id], candidates)
+                for group_candidates in self._eligible_lots_by_group.values()
+                for tool_id, candidates in group_candidates.items()
+            ),
+            key=lambda item: (item[0].available_time, item[0].tool_id),
+        )
+        self._dispatchable_candidates_cache = tuple(dispatchable_candidates)
 
     def _is_eligible(self, tool: ToolState, lot: LotState) -> bool:
         """校验单个策略配对，不为此重新扫描所有 lot。"""
@@ -1024,9 +1539,14 @@ class FabEngine:
         step = lot.current_step
         if step is None or step.tool_group_id != self._tool_group_by_id[tool.tool_id]:
             return False
+        if self._ready_group_by_lot.get(lot.id) != step.tool_group_id:
+            return False
         if not self._dedication_allowed_fast(lot, tool.tool_id):
             return False
-        return self._setup_allowed(step, tool.current_setup, tool.current_setup_run_length)
+        return (
+            self._setup_allowed(step, tool.current_setup, tool.current_setup_run_length)
+            and self._batch_minimum_reached(tool, lot)
+        )
 
     def _mark_ready(self, lot: LotState) -> None:
         """把刚进入等待状态的 lot 放入其当前工具组的有序索引。"""
@@ -1044,6 +1564,7 @@ class FabEngine:
         bucket.insert(index, lot)
         self._ready_group_by_lot[lot.id] = group_id
         self._candidate_groups_dirty.add(group_id)
+        self._dispatch_needed = True
         self._changed_lot_ids.add(lot.id)
 
     def _remove_ready(self, lot: LotState) -> None:
@@ -1061,23 +1582,20 @@ class FabEngine:
         self._candidate_groups_dirty.add(group_id)
 
     def _mark_idle(self, tool: ToolState) -> None:
-        if tool.tool_id not in self._idle_tools:
-            self._available_tools_cache = None
-        self._idle_tools.add(tool.tool_id)
-        self._idle_tools_by_group.setdefault(
-            self._tool_group_by_id[tool.tool_id], set()
-        ).add(tool.tool_id)
-        self._candidate_groups_dirty.add(self._tool_group_by_id[tool.tool_id])
+        group_id = self._tool_group_by_id[tool.tool_id]
+        tools = self._idle_tools_by_group.setdefault(group_id, set())
+        if tool.tool_id in tools:
+            return
+        tools.add(tool.tool_id)
+        self._candidate_groups_dirty.add(group_id)
+        self._dispatch_needed = True
 
     def _mark_busy(self, tool: ToolState) -> None:
-        if tool.tool_id in self._idle_tools:
-            self._available_tools_cache = None
-        self._idle_tools.discard(tool.tool_id)
         group_id = self._tool_group_by_id[tool.tool_id]
         tools = self._idle_tools_by_group.get(group_id)
-        if tools is None:
+        if tools is None or tool.tool_id not in tools:
             return
-        tools.discard(tool.tool_id)
+        tools.remove(tool.tool_id)
         if not tools:
             del self._idle_tools_by_group[group_id]
         self._candidate_groups_dirty.add(group_id)
@@ -1121,34 +1639,27 @@ class FabEngine:
         return group.unloading_time if group else 0.0
 
     def _setup_time(self, tool: ToolState, step: RouteStepSpec) -> float:
-        transition = next(
-            (
-                item
-                for item in self.model.setup_transitions
-                if item.current_setup == (tool.current_setup or "")
-                and item.new_setup == step.required_setup
-            ),
-            None,
+        transition = self._setup_transition_by_pair.get(
+            (tool.current_setup or "", step.required_setup)
         )
-        return self._duration(
-            transition.setup_time if transition else step.setup_distribution
+        return sample_duration(
+            self.rng,
+            transition.setup_time if transition else step.setup_distribution,
         )
 
     def _transport_time(self, lot: LotState) -> float:
-        if lot.operation_index == 0 or lot.operation_index >= len(lot.route):
+        if lot.operation_index >= len(lot.route):
             return 0.0
-        previous, following = (
-            lot.route[lot.operation_index - 1],
-            lot.route[lot.operation_index],
-        )
-        previous_group = self.model.tool_groups.get(previous.tool_group_id or "")
+        following = lot.route[lot.operation_index]
+        previous_group = self.model.tool_groups.get(lot.last_tool_group_id or "")
         following_group = self.model.tool_groups.get(following.tool_group_id or "")
         if previous_group is None or following_group is None:
             return 0.0
-        return self._duration(
+        return sample_duration(
+            self.rng,
             self._transport_by_location.get(
                 (previous_group.location, following_group.location)
-            )
+            ),
         )
 
     def _matching_tools(self, valid_for_type: str, type_name: str) -> list[ToolState]:
@@ -1179,23 +1690,3 @@ class FabEngine:
         # 优化：结果只依赖静态模型，缓存复用。
         self._matching_tools_cache[key] = result
         return result
-
-    def _duration(
-        self, distribution: DistributionSpec | None, fallback: float = 0.0
-    ) -> float:
-        if distribution is None:
-            return fallback
-        kind = distribution.kind.lower()
-        if kind in {"constant", "deterministic"}:
-            # SMT 的 SETUP 分布可能是 deterministic（固定值），等价于 constant。
-            return distribution.mean
-        if kind == "uniform":
-            # SMT 的 OFFSET 列可能是“±绝对偏差”或“±%偏差”两种语义，导入后
-            # offset 可能大于 mean（例如 Uniform(mean=10, offset=20)）。若直接
-            # uniform(mean-offset, mean+offset)，下界会为负 → 引擎会安排出
-            # “过去时刻”的事件而崩溃。这里把下界钳到 0，保证抽样时长恒为非负。
-            low = max(distribution.mean - distribution.offset, 0.0)
-            return self.rng.uniform(low, distribution.mean + distribution.offset)
-        if kind == "exponential":
-            return self.rng.expovariate(1 / distribution.mean)
-        raise ValueError(f"不支持的分布：{distribution.kind}。")

@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from fab.engine.events import EventKind
-from fab.model.entities import DistributionSpec, FabModel, LotReleaseSpec, LotState
+from fab.model.entities import FabModel, LotReleaseSpec, LotState
+from fab.sampling import sample_duration
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,20 @@ def _pop_or_remove(queue: deque[LotState], lot_id: str | None) -> LotState | Non
     return lot
 
 
+def _next_release_opportunity(
+    time: float, end_time: float, release_interval: float
+) -> SourceEventResult:
+    """安排下一个投料节拍，并标记当前时刻可进行投料决策。"""
+
+    next_time = time + release_interval
+    events = (
+        (SourceEvent(next_time, EventKind.LOT_RELEASE, {}),)
+        if next_time < end_time
+        else ()
+    )
+    return SourceEventResult(events, release_opportunity=True)
+
+
 class SyntheticOrderSource:
     """旧版的自动订单生成器。
 
@@ -111,13 +126,7 @@ class SyntheticOrderSource:
             )
             return SourceEventResult(events)
         if kind is EventKind.LOT_RELEASE:
-            next_time = time + release_interval
-            events = (
-                (SourceEvent(next_time, EventKind.LOT_RELEASE, {}),)
-                if next_time < end_time
-                else ()
-            )
-            return SourceEventResult(events, release_opportunity=True)
+            return _next_release_opportunity(time, end_time, release_interval)
         return None
 
     def generate_order(self, time: float) -> None:
@@ -201,7 +210,7 @@ class ExternalLotReleaseSource:
             index = int(payload["plan_index"])
             spec = self.model.lot_releases[index]
             self._generate_release(index, spec, time)
-            next_time = time + self._duration(spec.release_distribution)
+            next_time = time + sample_duration(self.rng, spec.release_distribution)
             events = (
                 (
                     SourceEvent(
@@ -215,13 +224,7 @@ class ExternalLotReleaseSource:
             # FIFO / EDD / CR 会在每次到达时立即放行，投料节拍就失去意义。
             return SourceEventResult(events)
         if kind is EventKind.LOT_RELEASE:
-            next_time = time + release_interval
-            events = (
-                (SourceEvent(next_time, EventKind.LOT_RELEASE, {}),)
-                if next_time < end_time
-                else ()
-            )
-            return SourceEventResult(events, release_opportunity=True)
+            return _next_release_opportunity(time, end_time, release_interval)
         return None
 
     def _generate_release(self, index: int, spec: LotReleaseSpec, time: float) -> None:
@@ -281,20 +284,6 @@ class ExternalLotReleaseSource:
                 kind == "uniform" and distribution.mean <= distribution.offset
             ):
                 raise ValueError("Lotrelease 的 release_distribution 必须产生正间隔。")
-
-    def _duration(self, distribution: DistributionSpec) -> float:
-        kind = distribution.kind.lower()
-        if kind == "constant":
-            return distribution.mean
-        if kind == "uniform":
-            return self.rng.uniform(
-                distribution.mean - distribution.offset,
-                distribution.mean + distribution.offset,
-            )
-        if kind == "exponential":
-            return self.rng.expovariate(1 / distribution.mean)
-        raise ValueError(f"不支持的投料间隔分布：{distribution.kind}。")
-
 
 def create_lot_source(model: FabModel, random_seed: int) -> LotSource:
     """根据显式 source_mode 创建唯一投料来源。"""

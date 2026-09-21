@@ -6,8 +6,6 @@ from fab.strategy import StrategyState,StrategyDecision
 class EDD:
     name = "EDD"
     run_id = "edd"
-    requires_available_tools = False
-
     def __init__(self):
         pass
 
@@ -22,9 +20,9 @@ class EDD:
         reserved_lot_ids : set[str] = set()
 
         #派工，遍历引擎中所有候选的lot并排序
-        for tool in state.dispatchable_tools:
+        for tool, eligible_candidates in state.dispatchable_candidates:
             candidates = [
-                lot for lot in state.eligible_lots_by_tool.get(tool.tool_id)
+                lot for lot in eligible_candidates
                 if lot.id not in reserved_lot_ids
             ]
             if not candidates:

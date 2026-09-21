@@ -45,6 +45,7 @@ class ToolGroupSpec:
     unloading_time_unit: str = "minute"
     location: str | None = None
     dispatch_rule: DispatchRuleSpec | None = None
+    cascading_capacity: int = 2
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,7 @@ class ProductSpec:
     name: str
     route: tuple[RouteStepSpec, ...]
     route_name: str | None = None
+    part_family: str | None = None
 
 
 @dataclass(frozen=True)
@@ -255,6 +257,8 @@ class ToolState:
     down_reason: str | None = None
     active_lot_id: str | None = None
     active_step_id: str | None = None
+    capacity: int = 1
+    active_count: int = 0
 
 
 @dataclass
@@ -285,6 +289,13 @@ class LotState:
     # LTL 绑定（如 step12 绑定供 step113 用、step57 绑定供 step79 用），
     # 各自独立互不覆盖。lot 到达目标工步时必须回对应绑定设备。
     dedicated_tools: dict[str, str] = field(default_factory=dict)
+    # 记录最近一道真正加工工步的位置，使跳过抽检工步后能从
+    # 上一台实际设备直接搬运到下一道实际加工工步。
+    last_tool_group_id: str | None = None
+    # SMT2020 返工要求重复工艺段使用原设备。历史表保存每个路线
+    # 位置最近的加工设备；返工绑定只在当前返工段内生效。
+    processed_tool_by_step: dict[int, str] = field(default_factory=dict)
+    rework_tool_bindings: dict[int, str] = field(default_factory=dict)
     operation_history: list[dict[str, object]] = field(default_factory=list)
 
     @property

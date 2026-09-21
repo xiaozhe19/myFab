@@ -121,6 +121,11 @@ python -m fab.run_model \
   --plugin fab.plugins.results:FinalStateSnapshotPlugin
 ```
 
+若策略需要自行决定批处理成员，可增加 `--batch-from-strategy`。此时策略必须在
+`StrategyDecision.batches` 中给出每个开炉设备的 lot 列表；引擎会校验工具组、
+批处理条件、最小/最大批量，并在设备 loading 前冻结该批次，避免成员被其他
+派工抢走。未启用该选项时，引擎继续使用内置的“按顺序尽量装满”组批规则。
+
 模型库不保存产品、路线、设备等派生对象，只保存原始 SMT 表；每次运行时在内存中构造
 `FabModel`。启用的结果插件通过 `run_id` 追加保存 lot、设备、工序记录和聚合 metrics。
 内核和结果库的规范时间单位均为 minute。运行时会显示进度条、百分比及模拟时间进度
