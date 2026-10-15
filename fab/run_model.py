@@ -34,6 +34,10 @@ def build_strategy(spec: str, parameters: dict[str, object] | None = None):
 
     if spec == "FIFO":
         return FIFOStrategy()
+    if spec == "SMT2020":
+        from strategy.smt2020_baseline import SMT2020BaselineStrategy
+
+        return SMT2020BaselineStrategy()
     try:
         module_name, class_name = spec.split(":", 1)
     except ValueError as error:
@@ -98,6 +102,7 @@ def run_simulation_from_database(
     release_interval: float | None = None,
     batch_from_strategy: bool = False,
     progress_callback: Callable[[float, float], None] | None = None,
+    rework_same_tool: bool = False,
 ) -> dict[str, object]:
     """从 SQLite 模型库运行任一已接入策略。"""
 
@@ -120,6 +125,7 @@ def run_simulation_from_database(
         progress_callback=progress_callback,
         batch_from_strategy=batch_from_strategy,
         plugin_manager=plugin_manager,
+        rework_same_tool=rework_same_tool,
     ).run(strategy)
 
 
@@ -160,6 +166,7 @@ def _run(args: argparse.Namespace) -> None:
     release_interval=args.release_interval,
     batch_from_strategy=args.batch_from_strategy,
     progress_callback=_print_progress,
+    rework_same_tool=args.rework_same_tool,
     )
     elapsed_seconds = time.perf_counter() - run_started_at
     print(f"{result['strategy']} finished in {elapsed_seconds:.1f}s.")
@@ -180,6 +187,11 @@ def main() -> None:
         "--batch-from-strategy",
         action="store_true",
         help="由策略返回 StrategyDecision.batches 决定批次成员，引擎只校验硬约束。",
+    )
+    parser.add_argument(
+        "--rework-same-tool",
+        action="store_true",
+        help="返工段强制回原设备（规范之外的假设，仅用于对比）；默认组内任意设备。",
     )
     parser.add_argument(
         "--plugin",

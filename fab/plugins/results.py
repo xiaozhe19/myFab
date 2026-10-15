@@ -12,6 +12,11 @@ class OnlineMetricsPlugin(FabPlugin):
         self._last_time = 0.0
         self._wip_lot_ids: set[str] = set()
         self._storage: ResultStorage | None = None
+        # 完工指标在 on_lot_completed 时累加：引擎会移出已完工的 lot。
+        self._completed_count = 0
+        self._cycle_times: list[float] = []
+        self._with_due_count = 0
+        self._on_time_count = 0
 
     def required_services(self) -> tuple[str, ...]:
         return ("result_storage",)
@@ -30,6 +35,10 @@ class OnlineMetricsPlugin(FabPlugin):
         self._wip_area = 0.0
         self._last_time = model.simulation.start_time
         self._wip_lot_ids.clear()
+        self._completed_count = 0
+        self._cycle_times = []
+        self._with_due_count = 0
+        self._on_time_count = 0
 
     def on_time_advanced(
             self,
@@ -66,6 +75,20 @@ class OnlineMetricsPlugin(FabPlugin):
 
     def on_lot_completed(self, current_time:float, lot:LotState) -> None:
         self._wip_lot_ids.discard(lot.id)
+        model = self._require_model()
+        measurement_start = (
+            model.simulation.start_time
+            + model.simulation.warmup_time
+        )
+        # 只统计 warm-up 之后完工的 lot。
+        if current_time < measurement_start:
+            return
+        self._completed_count += 1
+        self._cycle_times.append(current_time - lot.generation_time)
+        if lot.due_time is not None:
+            self._with_due_count += 1
+            if current_time <= lot.due_time:
+                self._on_time_count += 1
 
     def build_result(self, context:PluginResultContext) -> dict[str,object]:
         model = self._require_model()
@@ -84,36 +107,8 @@ class OnlineMetricsPlugin(FabPlugin):
             - measurement_start
         )
 
-        completed_lots = [
-            lot
-            for lot in context.lots
-            if (
-                lot.end_time is not None
-                and lot.end_time >= measurement_start
-            )
-        ]
-        cycle_times = [
-            lot.end_time - lot.generation_time
-            for lot in completed_lots
-            if lot.end_time is not None
-        ]
-
-        completed_with_due_date = [
-            lot
-            for lot in completed_lots
-            if lot.due_time is not None
-        ]
-
-        on_time_count = sum(
-            lot.end_time <= lot.due_time
-            for lot in completed_with_due_date
-            if (
-                lot.end_time is not None
-                and lot.due_time is not None
-            )
-        )
         measurement = {
-            "throughput": len(completed_lots),
+            "throughput": self._completed_count,
             "average_fab_wip": (
                 round(
                     self._wip_area / measurement_horizon,
@@ -124,19 +119,19 @@ class OnlineMetricsPlugin(FabPlugin):
             ),
             "p95_end_to_end_cycle_time": (
                 round(
-                    self._percentile(cycle_times, 0.95),
+                    self._percentile(self._cycle_times, 0.95),
                     3,
                 )
-                if cycle_times
+                if self._cycle_times
                 else 0.0
             ),
             "on_time_rate": (
                 round(
-                    on_time_count
-                    / len(completed_with_due_date),
+                    self._on_time_count
+                    / self._with_due_count,
                     6,
                 )
-                if completed_with_due_date
+                if self._with_due_count
                 else 0.0
             ),
             "release_pool_lots_at_end": (

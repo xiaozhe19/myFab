@@ -292,10 +292,11 @@ class LotState:
     # 记录最近一道真正加工工步的位置，使跳过抽检工步后能从
     # 上一台实际设备直接搬运到下一道实际加工工步。
     last_tool_group_id: str | None = None
-    # SMT2020 返工要求重复工艺段使用原设备。历史表保存每个路线
-    # 位置最近的加工设备；返工绑定只在当前返工段内生效。
+    # 历史表保存每个路线位置最近的加工设备。返工段内的工步必须重做：
+    # 值为 None 表示组内任意设备（SMT2020 默认），值为设备 ID 表示
+    # 引擎开启 rework_same_tool 时必须回原设备。只在当前返工段内生效。
     processed_tool_by_step: dict[int, str] = field(default_factory=dict)
-    rework_tool_bindings: dict[int, str] = field(default_factory=dict)
+    rework_tool_bindings: dict[int, str | None] = field(default_factory=dict)
     operation_history: list[dict[str, object]] = field(default_factory=list)
 
     @property

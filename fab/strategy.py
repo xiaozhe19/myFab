@@ -44,6 +44,8 @@ class StrategyDecision:
     release_lot: bool = False
     # 可选定向投料。给出时隐含放行，且必须引用当前订单池中的一个 lot。
     release_lot_id: str | None = None
+    # 可选一次放行多个指定 lot（按给出顺序入厂），不能与 release_lot_id 同时使用。
+    release_lot_ids: tuple[str, ...] = ()
     # 预留：策略主动组批 tool_id -> 同炉 lot 列表。仅在引擎
     # batch_from_strategy=True 时生效；缺省 None 表示引擎自主组批。
     batches: dict[str, list[LotState]] = field(default_factory=dict)
@@ -56,6 +58,8 @@ class FabStrategy(Protocol):
     """所有新策略遵守的接口。"""
 
     name: str
+    # 可选类属性 release_on_arrival = True：lot 到达 release pool 时即获得投料
+    # 决策机会（SMT2020 推式投料），不再使用固定投料节拍。
 
     def initialize(self, model: FabModel) -> None:
         """仿真开始前调用一次。"""
