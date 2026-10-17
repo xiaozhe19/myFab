@@ -38,7 +38,8 @@ from fab.strategy import (
     StrategyDecision,
     StrategyState,
 )
-
+from fab.engine.tool.batch import BatchRules
+from fab.engine.tool.downtime import Downtime
 # 从排序条目 (available_time, tool_id, tool, candidates) 中取出 (tool, candidates)。
 _TOOL_AND_CANDIDATES = itemgetter(2, 3)
 
@@ -54,18 +55,16 @@ class FabEngine:
         order_seed: int,
         progress_callback: Callable[[float, float], None] | None = None,
         *,
-        batch_from_strategy: bool = False,
         plugin_manager: PluginManager | None = None,
         rework_same_tool: bool = False,
     ) -> None:
         if model.time_unit != "minute":
             raise ValueError("FabEngine 只接受以 minute 为规范时间单位的 FabModel。")
-        self._batch_from_strategy = batch_from_strategy
         # SMT2020 只规定返工回到 STEP FOR REWORK；True 时额外要求返工段回原设备，
         # 仅用于与旧行为对比。
         self._rework_same_tool = rework_same_tool
-        # 策略主动组批的分组（StrategyDecision.batches）；None 表示引擎自主组批。
-        self._pending_batches: dict[str, list[LotState]] | None = None
+        # 策略主动组批的分组（StrategyDecision.batches）
+        self._pending_batches: dict[str, list[LotState]] = {}
         # Setups 表查表（含 CURRENT SETUP 为空的通配行）。最小连续加工量属于
         # Toolgroups.DISPATCHING 的 setupavoidance 派工规则，由策略负责。
         self._setup_rules = SetupRules(model)
@@ -181,18 +180,7 @@ class FabEngine:
             for group_id, tool_ids in tool_ids_by_group.items()
         }
 
-        self._batch_criteria_by_group: dict[str, dict[str, bool]] = {}
-        for group_id, group in self.model.tool_groups.items():
-            criterion = (group.batch_criterion or "").lower()
-            normalized = re.sub(r"[^a-z0-9]+", "", criterion)
-
-            self._batch_criteria_by_group[group_id] = {
-                "same_product": "sameproduct" in normalized,
-                "same_part_family": (
-                    "samepartfam" in normalized or "samepartfamily" in normalized
-                ),
-                "same_step": ("samestepname" in normalized or "samestep" in normalized),
-            }
+        self._batch_rules = BatchRules(model)
         # 候选表只会受某一工具组中的 ready lot 或 idle tool 变化影响。保留上一次
         # 结果，并在状态变化时仅重建对应工具组，避免每个运输/卸载事件都扫描全厂。
         self._eligible_lots_by_group: dict[str, dict[str, tuple[LotState, ...]]] = {}
@@ -202,6 +190,7 @@ class FabEngine:
         self._entries_by_group: dict[str, list[tuple]] = {}
         # 候选内容没变、但空闲设备的 available_time 可能变了的组：只需重排，不必重新筛选。
         self._order_dirty_groups: set[str] = set()
+        self._downtime = Downtime(self)
         # 优化：_matching_tools 的匹配结果只依赖静态模型（tools/tool_groups），
         # 与仿真状态无关，缓存后避免每次加工完成时重复扫描全部设备。
         self._matching_tools_cache: dict[tuple[str, str], list[ToolState]] = {}
@@ -518,16 +507,6 @@ class FabEngine:
     def _apply_decision(self, decision: StrategyDecision) -> None:
         """验证策略给出的配对，并启动该配对的物理事件链。"""
 
-        if decision.batches:
-            if self._pending_batches is None:
-                self._pending_batches = {}
-            for tool_id, members in decision.batches.items():
-                # 已冻结的批次正在 loading/setup，不能被新的策略分组覆盖。
-                if tool_id in self._pending_batches and self._tool_has_activities(
-                    tool_id
-                ):
-                    raise ValueError(f"设备 {tool_id} 已有冻结批次，不能重复指定。")
-                self._pending_batches[tool_id] = members
         assigned: set[str] = set()
         for tool_id, lot in decision.dispatches.items():
             tool = self.tool_states.get(tool_id)
@@ -733,102 +712,49 @@ class FabEngine:
 
     def _select_batch(self, tool: ToolState, first: LotState) -> list[LotState]:
         """选择与 first 同炉的 lot 列表（含 first）。
-
-        引擎自主组批：同工具组、同工艺、可加批的候选按到达顺序凑满
-        batch_maximum 片；策略未提供分组时退化为此规则。
         """
-
-        selected = (self._pending_batches or {}).pop(tool.tool_id, None)
-        if selected is not None:
-            members = selected
-        elif self._batch_from_strategy:
-            raise ValueError(f"策略模式必须为批处理设备 {tool.tool_id} 提供 batches。")
-        else:
-            members = self._gather_batch(tool, first)
-        self._validate_batch(tool, first, members)
-        return members
+        return self._pending_batches.pop(tool.tool_id)
 
     def _reserve_batch(self, tool: ToolState, first: LotState) -> list[LotState]:
-        """在 loading 前冻结批次成员，避免后续派工抢走同批 lot。"""
-
-        if self._pending_batches is None:
-            self._pending_batches = {}
-        selected = self._pending_batches.pop(tool.tool_id, None)
-        if selected is None:
-            if self._batch_from_strategy:
-                raise ValueError(
-                    f"策略模式必须为批处理设备 {tool.tool_id} 提供 batches。"
-                )
-            selected = self._gather_batch(tool, first)
-        self._validate_batch(tool, first, selected)
-        self._pending_batches[tool.tool_id] = selected
-        for member in selected:
+        """自动组批，在loading前冻结成员"""
+        # 凑批 保存 从等待队列中移除
+        members = self._gather_batch(tool,first)
+        self._pending_batches[tool.tool_id] = members
+        for member in members:
             self._remove_ready(member)
-        return selected
+
+        return members
 
     def _gather_batch(self, tool: ToolState, first: LotState) -> list[LotState]:
         """自动收集可同批的 lot（含 first），累计 wafer 不超过 batch_maximum。"""
 
         step = first.current_step
         if step is None:
-            raise ValueError("已完成 Lot 不能组批。")
-        members = [first]
-        quantity = self._batch_member_quantity(tool, first)
-        cap = step.batch_maximum
-        for candidate in self._ready_lots_by_group.get(step.tool_group_id or "", ()):
-            if (
-                candidate is first
-                or not self._same_batch_class(tool, first, candidate)
-                or not self._dedication_allowed_fast(candidate, tool.tool_id)
-            ):
-                continue
-            candidate_quantity = self._batch_member_quantity(tool, candidate)
-            if cap is not None and quantity + candidate_quantity > cap:
-                continue
-            members.append(candidate)
-            quantity += candidate_quantity
-        return members
+            raise ValueError(
+                "已完成Lot不能组批。"
+            )
+        candidates = self._ready_lots_by_group.get(
+            step.tool_group_id or "",()
+        )
+
+        return self._batch_rules.gather(
+            tool,
+            first,
+            candidates,
+            can_use_tool=self._dedication_allowed_fast,
+        )
 
     def _same_batch_class(
         self, tool: ToolState, first: LotState, candidate: LotState
     ) -> bool:
         """判断两个 lot 是否满足工具组的组批条件。"""
 
-        first_step = first.current_step
-        candidate_step = candidate.current_step
-        if first_step is None or candidate_step is None:
-            return False
-        if candidate_step.processing_unit != "batch":
-            return False
-        if candidate_step.tool_group_id != first_step.tool_group_id:
-            return False
-        group = self._tool_group(tool)
-        criteria = self._batch_criteria(group)
-        if criteria["same_product"] and candidate.product_id != first.product_id:
-            return False
-        if criteria["same_part_family"] and self._part_family(
-            candidate.product_id
-        ) != self._part_family(first.product_id):
-            return False
-        if criteria["same_step"]:
-            return candidate_step.id == first_step.id
-        if not any(criteria.values()):
-            # 未声明 criterion 时也不允许把两道不同工艺混在一炉。
-            return candidate_step == first_step
-        return True
+        return self._batch_rules.same_batch_class(tool,first,candidate)
 
     def _batch_member_quantity(self, tool: ToolState, lot: LotState) -> int:
         """按 Toolgroups.BATCHING UNIT 把单个 lot 换算为组批数量。"""
+        return self._batch_rules.member_quantity(tool, lot)
 
-        group = self._tool_group(tool)
-        unit = (group.batching_unit or "wafer").strip().lower() if group else "wafer"
-        if "wafer" in unit:
-            return lot.wafer_count
-        if "lot" in unit:
-            return 1
-        raise ValueError(
-            f"不支持的组批单位：{group.batching_unit if group else unit}。"
-        )
 
     def _validate_batch(
         self, tool: ToolState, first: LotState, members: list[LotState]
@@ -913,38 +839,14 @@ class FabEngine:
 
     def _batch_class_key(self, lot: LotState) -> tuple[object, ...]:
         """返回一炉内必须相同的静态属性。"""
-
-        step = lot.current_step
-        if step is None:
-            return (None,)
-        group = self.model.tool_groups.get(step.tool_group_id or "")
-        criteria = self._batch_criteria(group)
-        key: list[object] = [step.tool_group_id]
-        if criteria["same_product"]:
-            key.append(lot.product_id)
-        if criteria["same_part_family"]:
-            key.append(self._part_family(lot.product_id))
-        if criteria["same_step"]:
-            key.append(step.id)
-        elif not any(criteria.values()):
-            key.append(step)
-        return tuple(key)
+        return self._batch_rules.class_key(lot)
 
     def _batch_criteria(self, group: ToolGroupSpec | None) -> dict[str, bool]:
-        if group is None:
-            return {
-                "same_product": False,
-                "same_part_family": False,
-                "same_step": False,
-            }
-        return self._batch_criteria_by_group[group.id]
+        return self._batch_rules.criteria(group)
 
     def _part_family(self, product_id: str) -> str:
-        product = self.model.products.get(product_id)
-        if product is None:
-            return product_id
-        return product.part_family or product.id
-
+        return self._batch_rules.part_family(product_id)
+    
     def _dedication_allowed_fast(self, lot: LotState, tool_id: str) -> bool:
         """O(1) LTL 判断：当前工步若是进行中绑定的目标则必须回绑定设备。"""
         rework_tool = lot.rework_tool_bindings.get(lot.operation_index)
@@ -1103,31 +1005,10 @@ class FabEngine:
 
     def _handle_pm_due(self, event: SimulationEvent) -> None:
         """PM 到期后只登记；设备空闲时才真正开始维护。"""
-
-        tool = self.tool_states[str(event.payload["tool_id"])]
-        self._schedule_next_calendar_pm(event)
-        if tool.is_down or self._tool_has_activities(tool.tool_id):
-            self._pending_pms.setdefault(tool.tool_id, deque()).append(event)
-            return
-        self._begin_downtime(event, EventKind.PM_COMPLETE)
+        self._downtime.handle_pm_due(event)
 
     def _schedule_next_calendar_pm(self, event: SimulationEvent) -> None:
-        """time-based PM 按日历循环：MTBPM 是相邻两次到期的间隔，已包含 PM 时长，
-        设备忙导致的推迟也不会顺延后续 PM。"""
-
-        pm = self._pms_by_name.get(str(event.payload.get("pm_event")))
-        if pm is None or pm.pm_type != "time_based":
-            return
-        next_time = self.current_time + pm.mean_time_before_pm
-        if next_time < self.model.simulation.end_time:
-            self.schedule(
-                next_time,
-                EventKind.PM_DUE,
-                tool_id=event.payload["tool_id"],
-                duration=sample_duration(self.rng, pm.repair_distribution),
-                reason=f"pm:{pm.event_name}",
-                pm_event=pm.event_name,
-            )
+        self._downtime.schedule_next_calendar_pm(event)
 
     def _start_pending_pm_if_idle(self, tool: ToolState) -> bool:
         if tool.is_down or self._tool_has_activities(tool.tool_id):
