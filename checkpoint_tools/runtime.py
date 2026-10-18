@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fab.engine import FabEngine
+from fab.engine.tool.downtime import Downtime
 from fab.model.entities import LotState, ToolState
 from fab.plugins import FabPlugin, PluginManager
 
@@ -81,7 +82,7 @@ def lot_row(lot):
 
 def fingerprint(engine: FabEngine) -> dict[str, str]:
     fields = (
-        "_calendar", "_tokens", "_active", "_active_by_tool", "_paused",
+        "_calendar", "_tokens", "_active", "_paused",
         "_scheduled_tool_available", "_pending_downtimes", "_pending_pms",
         "_last_operation_completion", "_pending", "_dispatch_needed", "_done",
         "_next_counter_pm", "_lot_order", "_admitted_count", "_ready_lots_by_group",
@@ -113,7 +114,8 @@ def fingerprint(engine: FabEngine) -> dict[str, str]:
 
 
 def aliases_valid(engine: FabEngine) -> bool:
-    active = [lot for a in engine._active.values() for lot in a.get("batch_lots", [])]
+    active = [lot for activities in engine._active.values()
+              for activity in activities.values() for lot in activity.get("batch_lots", [])]
     ready = [lot for lots in engine._ready_lots_by_group.values() for lot in lots]
     return all(engine._lots_by_id.get(lot.id) is lot for lot in active + ready)
 
@@ -125,7 +127,7 @@ def save_checkpoint(path: Path, engine: FabEngine, *, seed: int, requested_day: 
     if source_hashes() != expected_sources:
         raise ValueError("Source files changed during the run.")
     state = engine.__dict__.copy()
-    for name in ("_sequence", "_plugin_manager", "_progress_callback"):
+    for name in ("_sequence", "_plugin_manager", "_progress_callback", "_downtime"):
         state.pop(name)
     payload = pickle.dumps({"engine_state": state, "sequence": sequence_arguments(engine)}, protocol=5)
     model_database = model_database.resolve()
@@ -142,7 +144,8 @@ def save_checkpoint(path: Path, engine: FabEngine, *, seed: int, requested_day: 
         "time_minute": engine.current_time, "actual_day": engine.current_time / DAY,
         "horizon_minute": engine.model.simulation.end_time, "stage": "release_decision_pending",
         "wip": len(engine.lots), "release_pool": len(engine.order_source.queue),
-        "calendar_events": len(engine._calendar), "active_activities": len(engine._active),
+        "calendar_events": len(engine._calendar),
+        "active_activities": sum(len(activities) for activities in engine._active.values()),
         "paused_tools": len(engine._paused), "payload_bytes": len(payload),
         "payload_sha256": sha256(payload), "fingerprint": fingerprint(engine),
         "certification": "See the completed experiment index.json; capture alone is not certification.",
@@ -188,6 +191,8 @@ def load_checkpoint(path: Path) -> tuple[FabEngine, dict]:
     saved = pickle.loads(payload)
     engine = FabEngine.__new__(FabEngine)
     engine.__dict__.update(saved["engine_state"])
+    # Downtime only holds an engine reference; bind it to the restored instance.
+    engine._downtime = Downtime(engine)
     engine._sequence = itertools.count(*saved["sequence"])
     engine._plugin_manager = PluginManager()
     engine._progress_callback = None

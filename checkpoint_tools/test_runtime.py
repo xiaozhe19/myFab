@@ -46,6 +46,7 @@ class CheckpointIntegrationTests(unittest.TestCase):
 
     def test_01_fresh_process_continuation_matches_uninterrupted(self):
         restored, _ = load_checkpoint(self.path)
+        self.assertIs(restored._downtime.engine, restored)
         self.assertEqual(fingerprint(restored), self.manifest["fingerprint"])
         self.assertGreater(len(restored.lots), 0)
         observer = attach_observer(restored)

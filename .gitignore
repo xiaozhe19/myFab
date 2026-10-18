@@ -15,3 +15,5 @@ tests/*
 tests
 fabotron
 research
+checkpoint_tools
+.pytest_cache

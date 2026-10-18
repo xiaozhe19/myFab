@@ -142,8 +142,7 @@ class FabEngine:
         self._calendar: list[SimulationEvent] = []
         self._sequence = count()
         self._tokens: dict[str, int] = {tool_id: 0 for tool_id in self.tool_states}
-        self._active: dict[tuple[str, int], dict[str, object]] = {}
-        self._active_by_tool: dict[str, dict[int, dict[str, object]]] = {}
+        self._active: dict[str, dict[int, dict[str, object]]] = {}
         self._paused: dict[str, list[dict[str, object]]] = {}
         self._scheduled_tool_available: set[tuple[str, float]] = set()
         # 同一设备可能在维修期间再次收到 PM/故障事件。不能丢弃这些事件，
@@ -549,7 +548,7 @@ class FabEngine:
             active: dict[str, object] = {}
         else:
             token = activity_token
-            active = self._active.get((tool.tool_id, token), {})
+            active = self._active.get(tool.tool_id, {}).get(token, {})
             if not active:
                 raise RuntimeError(
                     f"设备 {tool.tool_id} 的加工活动 token {token} 已失效。"
@@ -571,8 +570,8 @@ class FabEngine:
                 **payload,
             }
         )
-        self._active[(tool.tool_id, token)] = active
-        self._active_by_tool.setdefault(tool.tool_id, {})[token] = active
+        self._active.setdefault(tool.tool_id, {})[token] = active
+        
         tool.active_lot_id = lot.id
         current_step = lot.current_step
         tool.active_step_id = current_step.id if current_step else None
@@ -925,12 +924,11 @@ class FabEngine:
         if tool is None or lot is None or active is None:
             return
         token = int(active["token"])
-        self._active.pop((tool.tool_id, int(active["token"])), None)
-        tool_activities = self._active_by_tool.get(tool.tool_id)
+        tool_activities = self._active.get(tool.tool_id)
         if tool_activities is not None:
             tool_activities.pop(token, None)
             if not tool_activities:
-                self._active_by_tool.pop(tool.tool_id, None)
+                self._active.pop(tool.tool_id, None)
         members = active.get("batch_lots", [lot])
         finished_step = event.payload.get("finished_step")
         if not isinstance(finished_step, RouteStepSpec):
@@ -962,46 +960,7 @@ class FabEngine:
         self._mark_ready(lot)
 
     def _begin_downtime(self, event: SimulationEvent, completion: EventKind) -> None:
-        tool = self.tool_states[str(event.payload["tool_id"])]
-        if tool.is_down:
-            self._pending_downtimes.setdefault(tool.tool_id, deque()).append(
-                (event, completion)
-            )
-            return
-        paused: list[dict[str, object]] = []
-        for key, active in tuple(self._active.items()):
-            if key[0] != tool.tool_id:
-                continue
-            self._active.pop(key, None)
-
-            active["remaining"] = max(
-                float(active["finish"]) - self.current_time,
-                0.0,
-            )
-            # cascading 第二槽位的开放时刻随停机一起顺延。
-            active["next_start_remaining"] = max(
-                float(active.get("next_start", active["finish"])) - self.current_time,
-                0.0,
-            )
-            if active["completion"] is EventKind.OPERATION_COMPLETE:
-                active["worked"] = (
-                    float(active.get("worked", 0.0))
-                    + self.current_time
-                    - float(active["phase_start"])
-                )
-            paused.append(active)
-        self._active_by_tool.pop(tool.tool_id, None)
-        if paused:
-            # 一次停机使该设备所有旧 token 失效。
-            self._tokens[tool.tool_id] += 1
-            self._paused[tool.tool_id] = paused
-        tool.active_count = 0
-        tool.in_process = False
-        tool.active_lot_id = None
-        tool.active_step_id = None
-        self._mark_busy(tool)
-
-        self._start_downtime(tool, event, completion)
+        self._downtime.begin_downtime(event,completion)
 
     def _handle_pm_due(self, event: SimulationEvent) -> None:
         """PM 到期后只登记；设备空闲时才真正开始维护。"""
@@ -1011,16 +970,7 @@ class FabEngine:
         self._downtime.schedule_next_calendar_pm(event)
 
     def _start_pending_pm_if_idle(self, tool: ToolState) -> bool:
-        if tool.is_down or self._tool_has_activities(tool.tool_id):
-            return False
-        pending = self._pending_pms.get(tool.tool_id)
-        if not pending:
-            return False
-        event = pending.popleft()
-        if not pending:
-            del self._pending_pms[tool.tool_id]
-        self._begin_downtime(event, EventKind.PM_COMPLETE)
-        return True
+        return self._downtime.start_pending_pm_if_idle(tool)
 
     def _start_downtime(
         self,
@@ -1028,89 +978,11 @@ class FabEngine:
         event: SimulationEvent,
         completion: EventKind,
     ) -> None:
-        """启动一项停机；调用方负责保存正在进行的加工。"""
-
-        tool.is_down = True
-        tool.is_in_setup = False
-        tool.down_reason = str(event.payload.get("reason", event.kind.value))
-        duration = float(event.payload.get("duration", 0.0))
-        tool.available_time = self._time(self.current_time + duration)
-        self.schedule(
-            tool.available_time,
-            completion,
-            tool_id=tool.tool_id,
-            breakdown=event.payload.get("breakdown"),
-            pm_event=event.payload.get("pm_event"),
-        )
+        self._downtime.start_downtime(tool,event,completion)
 
     def _end_downtime(self, event: SimulationEvent) -> None:
-        tool = self.tool_states[str(event.payload["tool_id"])]
-        if event.kind is EventKind.REPAIR_COMPLETE and event.payload.get("breakdown"):
-            name = str(event.payload["breakdown"])
-            breakdown = self._breakdowns_by_name[name]
-            self.schedule(
-                self.current_time
-                + sample_duration(self.rng, breakdown.time_to_failure),
-                EventKind.BREAKDOWN,
-                tool_id=tool.tool_id,
-                duration=sample_duration(self.rng, breakdown.time_to_repair),
-                reason=f"breakdown:{name}",
-                breakdown=name,
-            )
-
-        # 当前停机结束后，优先执行维修期间积压的停机。设备只有在队列清空后
-        # 才恢复加工，避免 PM/故障重叠时其中一个事件被静默丢弃。
-        pending = self._pending_downtimes.get(tool.tool_id)
-        if pending:
-            next_event, next_completion = pending.popleft()
-            if not pending:
-                del self._pending_downtimes[tool.tool_id]
-            self._start_downtime(tool, next_event, next_completion)
-            return
-
-        tool.is_down = False
-        tool.down_reason = None
-        tool.available_time = self.current_time
-        if self._start_pending_pm_if_idle(tool):
-            return
-        paused_activities = self._paused.pop(tool.tool_id, [])
-        if not paused_activities:
-            self._refresh_tool_capacity(tool)
-            return
-
-        for paused in paused_activities:
-            lot = self._lot(str(paused["lot_id"]))
-            completion = paused["completion"]
-            if not isinstance(completion, EventKind):
-                raise RuntimeError("暂停活动缺少完成事件类型。")
-            payload = {
-                key: value
-                for key, value in paused.items()
-                if key
-                not in {
-                    "token",
-                    "completion",
-                    "lot_id",
-                    "step",
-                    "finish",
-                    "phase_start",
-                    "remaining",
-                    "next_start",
-                    "next_start_remaining",
-                    "batch_lots",
-                }
-            }
-            self._start_phase(
-                tool,
-                lot,
-                completion,
-                float(paused["remaining"]),
-                batch_lots=paused.get("batch_lots"),
-                next_start=self.current_time
-                + float(paused.get("next_start_remaining", paused["remaining"])),
-                **payload,
-            )
-
+        self._downtime.end_downtime(event)
+        
     def _route_rework(self, event: SimulationEvent) -> None:
         lot = self._lot(str(event.payload["lot_id"]))
         step_id = str(event.payload["step_id"])
@@ -1233,82 +1105,17 @@ class FabEngine:
     def _first_pm_offsets(
         self, pm: PreventiveMaintenanceSpec, tools: list[ToolState]
     ) -> list[float]:
-        """返回与 tools 对齐的首次 PM 时刻（time-based）或 wafer 阈值（counter）。
-
-        SMT2020：FOA 为 constant 时，组内 N 台设备的首次 PM 均匀错开，
-        按设备 ID 排序后第 k 台（k=1..N）在 k·FOA/N。其他分布逐台抽样。
-        """
-
-        fallback = (
-            pm.first_one_at if pm.first_one_at is not None else pm.mean_time_before_pm
-        )
-        distribution = pm.first_one_at_distribution
-        if distribution is not None and distribution.kind.lower() not in {
-            "constant",
-            "deterministic",
-        }:
-            return [sample_duration(self.rng, distribution, fallback) for _ in tools]
-        foa = distribution.mean if distribution is not None else fallback
-        rank = {
-            tool.tool_id: k
-            for k, tool in enumerate(sorted(tools, key=lambda t: t.tool_id), 1)
-        }
-        return [rank[tool.tool_id] * foa / len(tools) for tool in tools]
-
+        return self._downtime.first_pm_offsets(pm, tools)
+        
     def _schedule_calendar_maintenance(self) -> None:
-        for pm in self.model.preventive_maintenance:
-            if pm.pm_type != "time_based":
-                continue
-            tools = self._matching_tools(pm.valid_for_type, pm.type_name)
-            for tool, first in zip(tools, self._first_pm_offsets(pm, tools)):
-                self.schedule(
-                    self.current_time + first,
-                    EventKind.PM_DUE,
-                    tool_id=tool.tool_id,
-                    duration=sample_duration(self.rng, pm.repair_distribution),
-                    reason=f"pm:{pm.event_name}",
-                    pm_event=pm.event_name,
-                )
+        self._downtime.schedule_calendar_maintenance()
 
     def _schedule_counter_maintenance(self, tool: ToolState) -> None:
         """为当前设备检查并安排已达到计数阈值的 PM。"""
-
-        for pm in self._counter_pms_by_tool.get(tool.tool_id, ()):
-            key = (tool.tool_id, pm.event_name)
-            threshold = self._next_counter_pm[key]
-            while tool.processed_wafers >= threshold:
-                self.schedule(
-                    self.current_time,
-                    EventKind.PM_DUE,
-                    tool_id=tool.tool_id,
-                    duration=sample_duration(self.rng, pm.repair_distribution),
-                    reason=f"pm:{pm.event_name}",
-                    pm_event=pm.event_name,
-                )
-                threshold += pm.mean_time_before_pm
-            self._next_counter_pm[key] = threshold
+        self._downtime.schedule_counter_maintenance(tool)
 
     def _schedule_breakdowns(self) -> None:
-        for breakdown in self.model.breakdowns:
-            for tool in self._matching_tools(
-                breakdown.valid_for_type, breakdown.type_name
-            ):
-                if breakdown.first_one_at_distribution is not None:
-                    first = sample_duration(
-                        self.rng, breakdown.first_one_at_distribution
-                    )
-                elif breakdown.first_one_at is not None:
-                    first = breakdown.first_one_at
-                else:
-                    first = sample_duration(self.rng, breakdown.time_to_failure)
-                self.schedule(
-                    self.current_time + first,
-                    EventKind.BREAKDOWN,
-                    tool_id=tool.tool_id,
-                    duration=sample_duration(self.rng, breakdown.time_to_repair),
-                    reason=f"breakdown:{breakdown.event_name}",
-                    breakdown=breakdown.event_name,
-                )
+        self._downtime.schedule_breakdowns()
 
     def _schedule_wakeups(self, decision: StrategyDecision) -> None:
         for time, reason in decision.wakeups:
@@ -1323,7 +1130,11 @@ class FabEngine:
         tool_id = str(event.payload["tool_id"])
         token = int(event.payload.get("token", -1))
         tool = self.tool_states[tool_id]
-        active = self._active.get((tool_id, token))
+        try:
+            active = self._active[tool_id][token]
+        except KeyError:
+            # 停机或卸载后，旧完成事件可能已没有对应活动。
+            return None, None, None
         if active is None:
             return None, None, None
         return tool, self._lot(str(event.payload["lot_id"])), active
@@ -1334,7 +1145,7 @@ class FabEngine:
     def _refresh_tool_capacity(self, tool: ToolState) -> None:
         """按设备容量和槽位可用时间刷新空闲索引。"""
 
-        activities = self._active_by_tool.get(tool.tool_id)
+        activities = self._active.get(tool.tool_id)
         active_count = len(activities) if activities else 0
         tool.active_count = active_count
         tool.in_process = active_count > 0
@@ -1767,30 +1578,4 @@ class FabEngine:
         )
 
     def _matching_tools(self, valid_for_type: str, type_name: str) -> list[ToolState]:
-        key = (valid_for_type, type_name)
-        cached = self._matching_tools_cache.get(key)
-        if cached is not None:
-            return cached
-        kind = valid_for_type.lower()
-        if kind == "tool":
-            result = [
-                tool for tool in self.tool_states.values() if tool.tool_id == type_name
-            ]
-        elif kind == "toolgroup":
-            result = [
-                tool
-                for tool in self.tool_states.values()
-                if self.model.tools[tool.tool_id].tool_group_id == type_name
-            ]
-        elif kind == "area":
-            result = [
-                tool
-                for tool in self.tool_states.values()
-                if (group := self._tool_group(tool)) is not None
-                and group.area == type_name
-            ]
-        else:
-            raise ValueError(f"未知维护/故障适用范围：{valid_for_type}。")
-        # 优化：结果只依赖静态模型，缓存复用。
-        self._matching_tools_cache[key] = result
-        return result
+        return self._downtime.matching_tools(valid_for_type, type_name)

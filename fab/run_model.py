@@ -100,7 +100,6 @@ def run_simulation_from_database(
     plugin_manager:PluginManager,
     strategy_params_path: Path | None = None,
     release_interval: float | None = None,
-    batch_from_strategy: bool = False,
     progress_callback: Callable[[float, float], None] | None = None,
     rework_same_tool: bool = False,
 ) -> dict[str, object]:
@@ -123,7 +122,6 @@ def run_simulation_from_database(
         model,
         order_seed=order_seed,
         progress_callback=progress_callback,
-        batch_from_strategy=batch_from_strategy,
         plugin_manager=plugin_manager,
         rework_same_tool=rework_same_tool,
     ).run(strategy)
@@ -164,7 +162,6 @@ def _run(args: argparse.Namespace) -> None:
     plugin_manager=plugin_manager,
     strategy_params_path=args.strategy_params,
     release_interval=args.release_interval,
-    batch_from_strategy=args.batch_from_strategy,
     progress_callback=_print_progress,
     rework_same_tool=args.rework_same_tool,
     )
@@ -182,11 +179,6 @@ def main() -> None:
         "--release-interval",
         type=float,
         help="覆盖模型库中的投料决策间隔（minute）；用于校准，不改写模型库。",
-    )
-    parser.add_argument(
-        "--batch-from-strategy",
-        action="store_true",
-        help="由策略返回 StrategyDecision.batches 决定批次成员，引擎只校验硬约束。",
     )
     parser.add_argument(
         "--rework-same-tool",
