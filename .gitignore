@@ -13,7 +13,21 @@ docs
 docs/*
 tests/*
 tests
-fabotron
+
 research
 checkpoint_tools
 .pytest_cache
+
+# Research reports remain local, including previously tracked root reports.
+/report_*.md
+**/report.md
+/fabotron/experiments/
+
+# Generated datasets and checkpoints.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.fabcp
+*.pt
+*.npz
+report-*

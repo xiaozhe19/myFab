@@ -11,6 +11,7 @@ from fab.plugins.results import (
     FinalStateSnapshotPlugin,
     OnlineMetricsPlugin
 )
+from fab.plugins.tokenizer import TokenizerPlugin
 
 __all__ = [
     "CqtViolationPlugin",
@@ -20,5 +21,6 @@ __all__ = [
     "PluginManager",
     "PluginResultContext",
     "FinalStateSnapshotPlugin",
-    "OnlineMetricsPlugin"
+    "OnlineMetricsPlugin",
+    "TokenizerPlugin",
 ]

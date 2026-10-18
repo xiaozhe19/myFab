@@ -118,13 +118,18 @@ def run_simulation_from_database(
             ),
         )
     strategy = build_strategy(strategy_spec, _load_json_object(strategy_params_path))
-    return FabEngine(
+    engine = FabEngine(
         model,
         order_seed=order_seed,
         progress_callback=progress_callback,
         plugin_manager=plugin_manager,
         rework_same_tool=rework_same_tool,
-    ).run(strategy)
+    )
+    for plugin in plugin_manager.plugins:
+        bind_engine = getattr(plugin, "bind_engine", None)
+        if callable(bind_engine):
+            bind_engine(engine)
+    return engine.run(strategy)
 
 
 # 优化：进度条计时起始时刻（首次调用时初始化）。
