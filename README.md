@@ -183,7 +183,6 @@ python -m unittest fabotron.test_training
 | `fabotron/dataset.py` | Token SQLite 读取和时间划分 |
 | `fabotron/loss.py` | 候选状态 Loss 与评估指标 |
 | `fabotron/train.py` | 训练、验证选模、测试和 checkpoint |
-| `checkpoint_tools/` | 已有稳态诊断与严格恢复工具；旧 checkpoint 需要匹配原运行时 |
 
 这是学习与研究项目，尚未接入真实生产数据，也不提供工业部署或生产调度保证。
 

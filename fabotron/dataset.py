@@ -42,9 +42,13 @@ class TokenTrajectory:
     tokens: torch.Tensor
     times: np.ndarray
     interval_minutes: float
+    simulation_seed: int | None = None
+    strategy_id: str | None = None
 
     @property
     def name(self):
+        if self.strategy_id is not None:
+            return f"{self.strategy_id}/seed_{self.simulation_seed}/run_{self.run_id}"
         return f"{self.database.stem}/run_{self.run_id}"
 
     def manifest(self):
@@ -53,6 +57,7 @@ class TokenTrajectory:
             "schema_id": self.schema_id, "snapshots": len(self.tokens),
             "shape": list(self.tokens.shape), "first_time_minutes": float(self.times[0]),
             "last_time_minutes": float(self.times[-1]), "sample_interval_minutes": self.interval_minutes,
+            "simulation_seed": self.simulation_seed, "strategy_id": self.strategy_id,
         }
 
 
@@ -146,12 +151,15 @@ def load_trajectories(databases, *, run_id=None, max_snapshots=None):
 class TokenSequenceDataset(Dataset):
     """An item is (history, next complete token matrix, trajectory index)."""
 
-    def __init__(self, trajectories, segments, history_len):
+    def __init__(self, trajectories, segments, history_len, *, trajectory_ids=None):
         if history_len < 1:
             raise ValueError("history_len must be positive")
         if len(segments) != len(trajectories):
             raise ValueError("Each trajectory needs its own split segment")
         self.trajectories, self.history_len = trajectories, history_len
+        self.trajectory_ids = list(range(len(trajectories))) if trajectory_ids is None else list(trajectory_ids)
+        if len(self.trajectory_ids) != len(trajectories) or len(set(self.trajectory_ids)) != len(trajectories):
+            raise ValueError("Each trajectory needs a unique evaluation ID")
         self.samples, self.segments = [], []
         for index, (start, stop) in enumerate(segments):
             if not 0 <= start < stop <= len(trajectories[index].tokens):
@@ -170,7 +178,7 @@ class TokenSequenceDataset(Dataset):
         trajectory_index, start = self.samples[index]
         tokens = self.trajectories[trajectory_index].tokens
         target_index = start + self.history_len
-        return tokens[start:target_index], tokens[target_index], trajectory_index
+        return tokens[start:target_index], tokens[target_index], self.trajectory_ids[trajectory_index]
 
 
 def make_datasets(trajectories, history_len=8, train_fraction=0.7, val_fraction=0.15):
@@ -185,3 +193,70 @@ def make_datasets(trajectories, history_len=8, train_fraction=0.7, val_fraction=
         for name, bounds in zip(segments, [(0, train_stop), (train_stop, val_stop), (val_stop, total)]):
             segments[name].append(bounds)
     return {name: TokenSequenceDataset(trajectories, bounds, history_len) for name, bounds in segments.items()}
+
+
+def load_collection_datasets(manifest_path, history_len=8, cache_dir=None, max_snapshots=None):
+    """Hold out whole seeds; memory-map cached tokens rather than retaining every JSON buffer."""
+    from fabotron.data_collection.common import canonical_hash, file_hash, read_json, training_manifest, write_json
+
+    manifest_path = Path(manifest_path).resolve()
+    manifest, splits = training_manifest(manifest_path)
+    schema = manifest["contract"]["schema"]
+    validate_schema(schema)
+    if canonical_hash(schema) != manifest["contract"]["schema_id"]:
+        raise ValueError("Collection schema hash mismatch")
+    if max_snapshots is not None and max_snapshots < 2:
+        raise ValueError("max_snapshots must be at least 2")
+    cache_dir = Path(cache_dir).resolve() if cache_dir else manifest_path.parent / "token_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    loader_hash = file_hash(Path(__file__))
+    jobs = {(manifest_path.parent / job["database"]).resolve(): job for job in manifest["jobs"]}
+    trajectories, datasets = [], {}
+    for split, inputs in splits.items():
+        current = []
+        for item in inputs:
+            database = item["database"]
+            job = jobs[database]
+            count = job["result"]["snapshots"]
+            if max_snapshots is not None:
+                count = min(count, max_snapshots)
+            identity = {"database_sha256": job["result"]["database_sha256"], "run_id": item["run_id"],
+                        "schema_id": manifest["contract"]["schema_id"], "snapshots": count,
+                        "loader_sha256": loader_hash}
+            key = canonical_hash(identity)
+            array_path, metadata_path = cache_dir / f"{key}.npy", cache_dir / f"{key}.json"
+            if not array_path.is_file() or not metadata_path.is_file():
+                trajectory = load_trajectories([database], run_id=item["run_id"], max_snapshots=max_snapshots)[0]
+                if trajectory.schema != schema or len(trajectory.tokens) != count:
+                    raise ValueError(f"{database}: data differs from its collection manifest")
+                if file_hash(database) != identity["database_sha256"]:
+                    raise ValueError(f"{database}: database changed during cache construction")
+                temporary = array_path.with_suffix(".npy.tmp")
+                with temporary.open("wb") as stream:
+                    np.save(stream, trajectory.tokens.numpy(), allow_pickle=False)
+                temporary.replace(array_path)
+                write_json(metadata_path, {"identity": identity, "times": trajectory.times.tolist(),
+                                           "array_sha256": file_hash(array_path)})
+                del trajectory
+            metadata = read_json(metadata_path)
+            if metadata["identity"] != identity or file_hash(array_path) != metadata["array_sha256"]:
+                raise ValueError(f"Changed token cache: {array_path}; remove that cache pair and rebuild")
+            # Copy-on-write mapping is writable to torch, but never changes the on-disk cache.
+            values = np.load(array_path, mmap_mode="c", allow_pickle=False)
+            times = np.asarray(metadata["times"], dtype=np.float64)
+            interval = manifest["contract"]["sample_interval_minutes"]
+            if (values.shape != (count, len(schema["group_ids"]), schema["input_dim"])
+                    or values.dtype != np.float32 or len(times) != count or not np.isfinite(times).all()
+                    or not np.allclose(times, manifest["contract"]["capture_start_minutes"]
+                                       + np.arange(count) * interval, rtol=0, atol=1e-6)):
+                raise ValueError(f"Invalid token cache shape, dtype or times: {array_path}")
+            current.append(TokenTrajectory(database, item["run_id"], identity["schema_id"], schema,
+                                            torch.from_numpy(values), times, interval,
+                                            item["seed"], item["strategy_id"]))
+        offset = len(trajectories)
+        datasets[split] = TokenSequenceDataset(
+            current, [(0, len(trajectory.tokens)) for trajectory in current], history_len,
+            trajectory_ids=range(offset, offset + len(current)),
+        )
+        trajectories.extend(current)
+    return trajectories, datasets

@@ -31,3 +31,8 @@ checkpoint_tools
 *.pt
 *.npz
 report-*
+
+# HPC (Atlas/Vanda) upload scripts and profiling tools stay local.
+/fabotron/data_collection/hpc/
+/perf_tools/
+*.zip

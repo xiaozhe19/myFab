@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "model_database": "data/model/fab_model.sqlite",
+  "output_dir": "data/result/fabotron_480d_daily_v1",
+  "expected_simulation": {
+    "start_time": 0,
+    "end_time": 691200,
+    "warmup_time": 345600
+  },
+  "seed_splits": {
+    "train": [2026061700, 2026061701, 2026061702, 2026061703, 2026061704, 2026061705],
+    "validation": [2026061706, 2026061707],
+    "test": [2026061708, 2026061709]
+  },
+  "strategies": [
+    {"id": "FIFO", "factory": "FIFO", "policy": "FIFO"},
+    {"id": "SMT2020", "factory": "SMT2020", "policy": "SMT2020_BASELINE"},
+    {"id": "EDD", "factory": "strategy.edd:EDD", "policy": "EDD"},
+    {"id": "CR", "factory": "strategy.cr:CriticalRatio", "policy": "CR"}
+  ],
+  "tokenizer": {
+    "sample_interval_minutes": 360,
+    "horizon_minutes": 360,
+    "processing_edges_minutes": [30, 60, 120],
+    "downtime_ratio_edges": [0.05, 0.10, 0.20],
+    "wip_scale": 100,
+    "queue_scale": 100
+  },
+  "workers": 2,
+  "daily_metrics_plugin": "fab.plugins.daily_metrics:DailyMetricsPlugin"
+}

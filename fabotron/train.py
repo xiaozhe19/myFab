@@ -18,7 +18,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from fabotron.dataset import load_trajectories, make_datasets
+from fabotron.dataset import load_collection_datasets, load_trajectories, make_datasets
 from fabotron.loss import StateMetrics, TokenStateLoss
 from fabotron.model.fabotron import Fabotron
 
@@ -89,7 +89,7 @@ def build_bias(model_database, trajectory):
 
 
 def source_hashes():
-    paths = [Path(__file__), ROOT / "fabotron/dataset.py", ROOT / "fabotron/loss.py",
+    paths = [Path(__file__), ROOT / "fabotron/dataset.py", ROOT / "fabotron/loss.py", ROOT / "fabotron/data_collection/common.py",
              *sorted((ROOT / "fabotron/model").glob("*.py"))]
     return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
 
@@ -100,7 +100,10 @@ def write_json(path, data):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--database", type=Path, nargs="+", help="Defaults to the prepared FIFO and SMT2020 SQLite databases")
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--database", type=Path, nargs="+", help="Defaults to the prepared FIFO and SMT2020 SQLite databases")
+    sources.add_argument("--collection-manifest", type=Path, help="Complete collection manifest; hold out whole simulation seeds")
+    parser.add_argument("--token-cache", type=Path, help="Memory-mapped cache directory for a collection manifest")
     parser.add_argument("--run-id", type=int, help="Only this run_id; default includes every Tokenizer run")
     parser.add_argument("--model-database", type=Path, default=ROOT / "data/model/fab_model.sqlite")
     parser.add_argument("--no-route-bias", action="store_true")
@@ -127,6 +130,10 @@ def parse_args(argv=None):
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--max-snapshots", type=int, help="Prefix per run, for short smoke checks")
     args = parser.parse_args(argv)
+    if args.collection_manifest and (args.run_id is not None or args.train_fraction != 0.7 or args.val_fraction != 0.15):
+        parser.error("Collection manifests define runs and whole-seed splits; do not override them with temporal split options")
+    if args.token_cache and not args.collection_manifest:
+        parser.error("--token-cache requires --collection-manifest")
     if min(args.history_len, args.batch_size, args.epochs, args.patience, args.threads, args.ff_mult) < 1:
         parser.error("Lengths, batch size, epochs, patience, threads and ff-mult must be positive")
     if args.d_model < 2 or args.d_model % 2:
@@ -156,10 +163,16 @@ def main(argv=None):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     print(f"Training device: {device}", flush=True)
-    databases = args.database or [DEFAULT_DATA / "FIFO.sqlite", DEFAULT_DATA / "SMT2020.sqlite"]
-    trajectories = load_trajectories(databases, run_id=args.run_id, max_snapshots=args.max_snapshots)
+    if args.collection_manifest:
+        trajectories, datasets = load_collection_datasets(
+            args.collection_manifest, args.history_len, args.token_cache, args.max_snapshots,
+        )
+        databases = [trajectory.database for trajectory in trajectories]
+    else:
+        databases = args.database or [DEFAULT_DATA / "FIFO.sqlite", DEFAULT_DATA / "SMT2020.sqlite"]
+        trajectories = load_trajectories(databases, run_id=args.run_id, max_snapshots=args.max_snapshots)
+        datasets = make_datasets(trajectories, args.history_len, args.train_fraction, args.val_fraction)
     schema = trajectories[0].schema
-    datasets = make_datasets(trajectories, args.history_len, args.train_fraction, args.val_fraction)
     objective = TokenStateLoss(schema, mode=args.loss, smooth_count=args.smooth_count,
                                weights={"W": args.lambda_w, "Q": args.lambda_q, "P": args.lambda_p, "E": args.lambda_e})
     if args.loss_normalization == "training-reference":
@@ -184,6 +197,12 @@ def main(argv=None):
     config = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
     config["database"] = [str(Path(path).resolve()) for path in databases]
     config["output_dir"] = str(output_dir)
+    config["split_method"] = "whole_simulation_seed" if args.collection_manifest else "within_trajectory_time"
+    if args.collection_manifest:
+        config["collection_manifest"] = str(args.collection_manifest.resolve())
+        config["collection_manifest_sha256"] = hashlib.sha256(args.collection_manifest.read_bytes()).hexdigest()
+        config["token_cache"] = str(args.token_cache.resolve() if args.token_cache else
+                                    args.collection_manifest.resolve().parent / "token_cache")
     manifest = {
         "started_at": datetime.now(HK_TIME).isoformat(), "config": config, "device": str(device),
         "torch_version": str(torch.__version__), "model_config": model_config,

@@ -14,7 +14,6 @@ from fab.model.entities import FabModel
 from fab.plugins.base import FabPlugin, PluginResultContext
 from fab.plugins.storage import LotEventRecord, OperationRecord, ResultStorage
 
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id INTEGER PRIMARY KEY,
@@ -56,8 +55,9 @@ CREATE TABLE IF NOT EXISTS plugin_records (
 );
 """
 
-BATCH_SIZE = 5_000 #积累n条记录后一起executemany
-QUEUE_SIZE = 20_000 #主线程最多领先数据库n条记录，queue满了主线程阻塞
+BATCH_SIZE = 700  # 积累n条记录后一起executemany
+QUEUE_SIZE = 20_000  # 主线程最多领先数据库n条记录，queue满了主线程阻塞
+
 
 @dataclass(frozen=True)
 class _MetricsMessage:
@@ -76,16 +76,17 @@ class _ExtensionMessage:
 class _FinishMessage:
     strategy_name: str
 
+
 class SQLiteStoragePlugin(FabPlugin, ResultStorage):
     """仅负责 SQLite 连接、SQL 执行和事务管理。"""
 
     def __init__(self, database_path: str | Path) -> None:
         self.database_path = Path(database_path)
-        self._queue: queue.Queue[object]|None = None
-        self._worker: threading.Thread|None = None
+        self._queue: queue.Queue[object] | None = None
+        self._worker: threading.Thread | None = None
         self._ready = threading.Event()
         self._finished = threading.Event()
-        self._worker_error:BaseException|None = None
+        self._worker_error: BaseException | None = None
 
     def provided_services(self) -> dict[str, object]:
         return {"result_storage": self}
@@ -121,8 +122,8 @@ class SQLiteStoragePlugin(FabPlugin, ResultStorage):
             raise RuntimeError("SQLite 写入线程失败。") from self._worker_error
 
     def _enqueue(
-            self,
-            message: object,
+        self,
+        message: object,
     ) -> None:
         if self._queue is None:
             raise RuntimeError("SQLiteStoragePlugin 尚未启动。")
@@ -134,7 +135,7 @@ class SQLiteStoragePlugin(FabPlugin, ResultStorage):
                 return
             except queue.Full:
                 continue
-    
+
     def append_operation(self, record: OperationRecord) -> None:
         self._enqueue(record)
 
@@ -151,14 +152,15 @@ class SQLiteStoragePlugin(FabPlugin, ResultStorage):
         payload: dict[str, object],
         event_time: float | None = None,
     ) -> None:
-        self._enqueue(_ExtensionMessage(
-            plugin_name,
-            record_type, 
-            payload, 
-            event_time,
-            ))
-            
-           
+        self._enqueue(
+            _ExtensionMessage(
+                plugin_name,
+                record_type,
+                payload,
+                event_time,
+            )
+        )
+
     def finish_run(self, strategy_name: str) -> None:
         self._enqueue(_FinishMessage(strategy_name))
 
@@ -297,10 +299,7 @@ class SQLiteStoragePlugin(FabPlugin, ResultStorage):
                     raise TypeError(f"未知的 SQLite 写入消息：{type(message).__name__}")
 
                 if (
-                    len(operations)
-                    + len(lot_events)
-                    + len(metrics)
-                    + len(extensions)
+                    len(operations) + len(lot_events) + len(metrics) + len(extensions)
                     >= BATCH_SIZE
                 ):
                     flush()
