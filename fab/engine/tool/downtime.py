@@ -76,12 +76,6 @@ class Downtime:
                 float(active.get("next_start", active["finish"])) - engine.current_time,
                 0.0,
             )
-            if active["completion"] is EventKind.OPERATION_COMPLETE:
-                active["worked"] = (
-                    float(active.get("worked", 0.0))
-                    + engine.current_time
-                    - float(active["phase_start"])
-                )
             paused.append(active)
         if paused:
             # 一次停机使该设备所有旧 token 失效。
@@ -178,7 +172,7 @@ class Downtime:
                         "batch_lots",
                     }
                 }
-                engine._start_phase(
+                engine._process.start_phase(
                     tool,
                     lot,
                     completion,

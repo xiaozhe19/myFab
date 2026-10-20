@@ -36,3 +36,7 @@ report-*
 /fabotron/data_collection/hpc/
 /perf_tools/
 *.zip
+
+# Local-only: optimization reports and Vanda training tools.
+/OPTIMIZATION_REPORT_*.md
+/training_tools/

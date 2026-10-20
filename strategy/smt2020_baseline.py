@@ -59,7 +59,7 @@ class SMT2020BaselineStrategy:
             group_id: _normalize(group.dispatch_rule.name if group.dispatch_rule else None)
             for group_id, group in model.tool_groups.items()
         }
-        # 与引擎 _batch_criteria 相同的组批条件解析，用于预判引擎自动组批的成员。
+        # 与 BatchRules 相同的组批条件解析，用于预判自动组批的成员。
         self._batch_criteria_by_group: dict[str, tuple[bool, bool, bool]] = {}
         for group_id, group in model.tool_groups.items():
             criterion = _normalize(group.batch_criterion)
@@ -348,7 +348,7 @@ class SMT2020BaselineStrategy:
         candidates: tuple[LotState, ...],
         used_lot_ids: set[str],
     ) -> list[LotState]:
-        """按引擎 _gather_batch 的规则预判同批成员（按入厂顺序装到 batch_maximum）。"""
+        """按 Batching.gather 的规则预判同批成员（按入厂顺序装到 batch_maximum）。"""
 
         step = first.current_step
         if step is None:

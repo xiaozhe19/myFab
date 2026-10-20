@@ -272,7 +272,9 @@ def main(argv=None):
             "Raw outputs are unconstrained; nonnegativity, probability sums and queue/WIP consistency are not enforced.",
             "M/B/policy and static total_tools output columns are not supervised and must not be used as predictions.",
             "Projected composition TV clips and renormalizes for evaluation only; raw probability-mass errors are also reported.",
-            "Time holdout within a trajectory is not independent simulation-seed evaluation; no rollout evaluation is performed.",
+            ("Simulation seeds are held out by the collection manifest; no rollout evaluation is performed."
+             if args.collection_manifest else
+             "Time holdout within a trajectory is not independent simulation-seed evaluation; no rollout evaluation is performed."),
         ],
     }
     write_json(output_dir / "summary.json", summary)
