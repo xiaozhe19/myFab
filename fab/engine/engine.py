@@ -8,6 +8,7 @@ from __future__ import annotations
 import heapq
 import random
 import re
+import weakref
 from bisect import bisect_right
 from collections import deque
 from itertools import chain, count
@@ -31,10 +32,14 @@ from fab.model.entities import (
 from fab.plugins import PluginManager, PluginResultContext
 from fab.order_source import LotSource, create_lot_source
 from fab.sampling import sample_duration, sample_duration_sum
+from fab.snapshot_collections import SnapshotDeque, SnapshotList
 from fab.setup_rules import SetupRules
 from fab.strategy import (
+    RELEASE_TRIGGERS,
     DispatchableCandidate,
+    CompletionSnapshot,
     FabStrategy,
+    ReleasePolicy,
     StrategyDecision,
     StrategyState,
 )
@@ -47,8 +52,25 @@ from fab.engine.tool.process import Process
 _TOOL_AND_CANDIDATES = itemgetter(2, 3)
 
 
+class _ReleaseHandle:
+    """交给投料员的"下单电话"：只登记，由引擎在结算点统一执行。"""
+
+    def __init__(self, engine: FabEngine) -> None:
+        self._engine = engine
+
+    def release(self, lot_id: str) -> None:
+        self._engine._release_orders.append(lot_id)
+
+    def schedule_wakeup(self, time: float) -> None:
+        engine = self._engine
+        if time < engine.current_time:
+            raise ValueError("投料闹钟不能早于当前时间。")
+        if time < engine.model.simulation.end_time:
+            engine.schedule(time, EventKind.RELEASE_WAKEUP)
+
+
 class FabEngine:
-    """执行客观事件；策略决定 release 与 dispatch。"""
+    """执行客观事件；策略决定 dispatch，投料员决定 release。"""
 
     _TIME_DIGITS = 6
 
@@ -80,7 +102,6 @@ class FabEngine:
             )
             for product_id, product in model.products.items()
         }
-        self._release_on_arrival = False
         self.model = model
         # 事件日历和 ToolState.available_time 必须使用同一精度。否则两者只差
         # 极小浮点误差时，空闲索引会认为设备可派工，而最终合法性校验会拒绝它。
@@ -123,7 +144,7 @@ class FabEngine:
             self._transport_by_location.setdefault(
                 (rule.from_location, rule.to_location), rule.transport_time
             )
-        self.lots: list[LotState] = []
+        self.lots: list[LotState] = SnapshotList()
         self._lots_by_id: dict[str, LotState] = {}
         self._changed_lot_ids: set[str] = set()
         # 当前可派工的 lot，按工具组增量维护。列表始终按进入 fab 的顺序，
@@ -154,8 +175,16 @@ class FabEngine:
         )
         self._pending_pms: dict[str, deque[SimulationEvent]] = {}
         self._last_operation_completion: dict[tuple[str, int], float] = {}
+        self._completion_snapshot_ref: weakref.ReferenceType[CompletionSnapshot] | None = None
         self._strategy: FabStrategy | None = None
-        self._pending: StrategyDecision | None = None
+        self._release_policy: ReleasePolicy | None = None
+        self._release_handle = _ReleaseHandle(self)
+        # 投料员订阅了哪些触发；热路径里只检查布尔值。
+        self._notify_arrival = False
+        self._notify_completion = False
+        # 事件处理中只记录触发，结算点再通知投料员（构造 state 有副作用）。
+        self._fired_triggers: set[str] = set()
+        self._release_orders: list[str] = []
         # ready lot 或 idle tool 的出现意味着合法派工动作可能增加。这个标记只
         # 表示需要询问策略，不代表引擎替策略选择或执行任何派工动作。
         self._dispatch_needed = False
@@ -261,8 +290,15 @@ class FabEngine:
         if self._strategy is not None:
             raise RuntimeError("一个引擎实例只能运行一次。")
         self._strategy = strategy
-        # 推式投料：lot 到达 release pool 即为投料决策点，不再需要固定节拍。
-        self._release_on_arrival = bool(getattr(strategy, "release_on_arrival", False))
+        policy = getattr(strategy, "release", None)
+        if policy is None:
+            raise TypeError(f"策略 {strategy.name} 没有提供投料员 release。")
+        unknown = set(policy.triggers) - set(RELEASE_TRIGGERS)
+        if unknown:
+            raise ValueError(f"投料员订阅了未知触发：{sorted(unknown)}。")
+        self._release_policy = policy
+        self._notify_arrival = "order_arrival" in policy.triggers
+        self._notify_completion = "lot_completed" in policy.triggers
         strategy.initialize(self.model)
         self._plugin_manager.on_simulation_started(self.model)
         # 优化：初始空闲设备集合 = 初始可用（未占用、未故障、已到可用时刻）的设备。
@@ -272,26 +308,20 @@ class FabEngine:
         for event in self.order_source.initial_events(
             self.current_time,
             self.model.simulation.end_time,
-            self.model.simulation.release_interval,
         ):
-            if self._release_on_arrival and event.kind is EventKind.LOT_RELEASE:
-                continue
             self.schedule(event.time, event.kind, **event.payload)
+        policy.initialize(self.model, self._release_handle)
         self.schedule(self.model.simulation.end_time, EventKind.SIMULATION_END)
         self._downtime.schedule_calendar_maintenance()
         self._downtime.schedule_breakdowns()
 
     def run(self, strategy: FabStrategy) -> dict[str, object]:
         self.begin_episode(strategy)
-        while self.advance_until_release() is not None:
-            self.apply_release_action(None)
+        self.advance()
         return self.finish_episode()
 
-    def advance_until_release(self) -> StrategyState | None:
-        """推进客观事件，直到下一次需要外部 release 动作的时刻。"""
-
-        if self._pending is not None:
-            return self._state(True)
+    def advance(self) -> None:
+        """推进事件直到仿真结束。"""
 
         while self._calendar:
             self.current_time = self._calendar[0].time
@@ -300,7 +330,6 @@ class FabEngine:
                 self._plugin_manager.on_time_advanced(self.current_time, self.lots)
             event_kinds: list[str] = []
             reasons: list[str] = []
-            release_opportunity = False
             forced_decision = False
             simulation_end = False
 
@@ -309,21 +338,18 @@ class FabEngine:
             while self._calendar and self._calendar[0].time == self.current_time:
                 event = heapq.heappop(self._calendar)
                 event_kinds.append(event.kind.value)
-                event_release, event_forced = self._handle_event(event, reasons)
-                release_opportunity |= event_release
-                forced_decision |= event_forced
+                forced_decision |= self._handle_event(event, reasons)
                 simulation_end |= event.kind is EventKind.SIMULATION_END
 
             if simulation_end:
                 self._done = True
-                return None
-            if release_opportunity:
-                # 投料决策使用的同一份状态也包含当前派工候选，因此同时消费此前
+                return
+            if self._fired_triggers:
+                # 投料结算的同一份状态也包含当前派工候选，因此同时消费此前
                 # 累积的派工通知；是否真的派工仍完全由策略决定。
                 self._dispatch_needed = False
-                state = self._state(True, event_kinds, reasons)
-                self._pending = self._decide(state, "release")
-                return state
+                self._settle_release(self._state(event_kinds, reasons))
+                continue
 
             if self._dispatch_needed or forced_decision:
                 # ready/idle 状态变化只说明候选可能增加。先更新候选索引；若确实
@@ -334,7 +360,6 @@ class FabEngine:
                     continue
                 decision = self._decide(
                     self._state(
-                        False,
                         event_kinds,
                         reasons,
                         dispatchable_candidates=dispatchable_candidates,
@@ -346,53 +371,30 @@ class FabEngine:
                 self._schedule_wakeups(decision)
 
         self._done = True
-        return None
 
-    def apply_release_action(self, release_lot: bool | None) -> None:
-        """执行策略的 release 决定，或由 RL 覆盖该布尔动作。"""
+    def _settle_release(self, state: StrategyState) -> None:
+        """投料结算点：派工与投料基于同一份 state，先派工、再执行投料单。"""
 
-        if self._pending is None:
-            raise RuntimeError("当前没有投料决策点。")
-        decision, self._pending = self._pending, None
-        if decision.release_lot_id is not None and decision.release_lot_ids:
-            raise ValueError("release_lot_id 与 release_lot_ids 不能同时使用。")
-        if release_lot is not None:
-            if decision.release_lot_id is not None or decision.release_lot_ids:
-                raise ValueError(
-                    "定向投料必须由策略返回 lot ID，不能用布尔 RL 动作覆盖。"
-                )
-            decision.release_lot = bool(release_lot)
+        decision = self._decide(state, "release")
+        policy = self._release_policy
+        for trigger in RELEASE_TRIGGERS:
+            if trigger in self._fired_triggers:
+                policy.on_trigger(trigger, state, self._release_handle)
+        self._fired_triggers.clear()
         self._apply_decision(decision)
         self._schedule_wakeups(decision)
 
-        if decision.release_lot_ids:
-            requested: tuple[str | None, ...] = decision.release_lot_ids
-        elif decision.release_lot_id is not None:
-            requested = (decision.release_lot_id,)
-        elif decision.release_lot:
-            requested = (None,)
-        else:
-            return
-        admitted = False
-        for lot_id in requested:
+        orders, self._release_orders = self._release_orders, []
+        for lot_id in orders:
             lot = self.order_source.release(self.current_time, lot_id)
             if lot is None:
-                if lot_id is not None:
-                    raise ValueError(f"定向投料引用了不在订单池中的 lot：{lot_id}。")
-                continue
+                raise ValueError(f"投料单引用了不在订单池中的 lot：{lot_id}。")
             self._admit_lot(lot)
-            admitted = True
-        if not admitted:
+        if not orders:
             return
         # 新 Lot 入厂后由策略再次决定派工；引擎不替它选设备或 Lot。
         self._dispatch_needed = False
-        follow_up = self._decide(self._state(False), "follow_up")
-        if (
-            follow_up.release_lot
-            or follow_up.release_lot_id is not None
-            or follow_up.release_lot_ids
-        ):
-            raise ValueError("策略只能在投料决策点请求投料。")
+        follow_up = self._decide(self._state(), "follow_up")
         self._apply_decision(follow_up)
         self._schedule_wakeups(follow_up)
 
@@ -444,10 +446,8 @@ class FabEngine:
             self._plugin_manager.on_simulation_finished(context)
         return self._result
 
-    def _handle_event(
-        self, event: SimulationEvent, reasons: list[str]
-    ) -> tuple[bool, bool]:
-        """结算一条客观事件，返回（投料机会，强制策略唤醒）。"""
+    def _handle_event(self, event: SimulationEvent, reasons: list[str]) -> bool:
+        """结算一条客观事件，返回是否强制唤醒策略。"""
 
         kind = event.kind
         forced_decision = kind in {
@@ -459,17 +459,13 @@ class FabEngine:
             kind,
             event.payload,
             self.model.simulation.end_time,
-            self.model.simulation.release_interval,
         )
         if source_result is not None:
             for next_event in source_result.next_events:
                 self.schedule(next_event.time, next_event.kind, **next_event.payload)
-            arrival = kind in {EventKind.LOT_AVAILABLE, EventKind.ORDER_ARRIVAL}
-            return (
-                source_result.release_opportunity
-                or (self._release_on_arrival and arrival),
-                forced_decision,
-            )
+            if self._notify_arrival:
+                self._fired_triggers.add("order_arrival")
+            return forced_decision
         # 装载/卸载是固定时长，不再单独产生事件：装载并入换型或加工阶段，
         # 卸载并入加工阶段，OPERATION_COMPLETE 在卸载结束时刻触发。
         if kind is EventKind.SETUP_COMPLETE:
@@ -502,7 +498,9 @@ class FabEngine:
         elif kind is EventKind.BATCH_READY:
             # 批量组成由策略返回的动作决定；引擎只提供此唤醒事件。
             reasons.append("batch_ready")
-        return False, forced_decision
+        elif kind is EventKind.RELEASE_WAKEUP:
+            self._fired_triggers.add("release_wakeup")
+        return forced_decision
 
     def _apply_decision(self, decision: StrategyDecision) -> None:
         """验证策略给出的配对，并启动该配对的物理事件链。"""
@@ -553,7 +551,7 @@ class FabEngine:
         """setup 状态不构成引擎硬约束。
 
         Setups 表的最小连续加工量由 Toolgroups.DISPATCHING 的
-        setupavoidance 派工规则执行，属于策略职责（见 strategy/smt2020_baseline.py）。
+        setupavoidance 派工规则执行，属于策略职责（见 strategy/base_rule.py）。
         保留此函数以维持候选构建的调用点不变。
         """
         return True
@@ -585,6 +583,10 @@ class FabEngine:
             operation_key = self._operation_keys_by_product[member.product_id][
                 member.operation_index
             ]
+            # Outstanding states retain their old version without forcing every
+            # state to copy a table that most strategies never read.
+            if self._completion_snapshot_ref is not None:
+                self._detach_completion_snapshot()
             self._last_operation_completion[operation_key] = process_end
             member.last_tool_group_id = step.tool_group_id
             member.processed_tool_by_step[member.operation_index] = tool.tool_id
@@ -699,13 +701,15 @@ class FabEngine:
         self._changed_lot_ids.add(lot.id)
         self._plugin_manager.on_lot_completed(self.current_time, lot)
         self._completed_pending.append(lot)
+        if self._notify_completion:
+            self._fired_triggers.add("lot_completed")
 
     def _drop_completed_lots(self) -> None:
         if not self._completed_pending:
             return
         for lot in self._completed_pending:
             del self._lots_by_id[lot.id]
-        self.lots = [lot for lot in self.lots if lot.end_time is None]
+        self.lots = SnapshotList(lot for lot in self.lots if lot.end_time is None)
         self._completed_pending.clear()
 
     def _record_cqt_violation(self, event: SimulationEvent) -> None:
@@ -851,9 +855,13 @@ class FabEngine:
                 self._scheduled_tool_available.add(key)
         self._mark_busy(tool)
 
+    def _detach_completion_snapshot(self) -> None:
+        if self._completion_snapshot_ref() is not None:
+            self._last_operation_completion = self._last_operation_completion.copy()
+        self._completion_snapshot_ref = None
+
     def _state(
         self,
-        release_opportunity: bool,
         event_kinds: list[str] | None = None,
         reasons: list[str] | None = None,
         dispatchable_candidates: tuple[DispatchableCandidate, ...] | None = None,
@@ -863,29 +871,35 @@ class FabEngine:
         if dispatchable_candidates is None:
             dispatchable_candidates = self._candidate_index()
         # set 的遍历顺序随 PYTHONHASHSEED 变化；按入厂顺序输出保证可复现。
-        changed_lots = tuple(
-            sorted(
-                (
-                    self._lots_by_id[lot_id]
-                    for lot_id in self._changed_lot_ids
-                    if lot_id in self._lots_by_id
-                ),
-                key=lambda lot: self._lot_order[lot.id],
-            )
-        )
+        changed_lots_list = [self._lots_by_id[lot_id] for lot_id in self._changed_lot_ids
+                             if lot_id in self._lots_by_id]
+        if len(changed_lots_list) > 1:
+            changed_lots_list.sort(key=lambda lot: self._lot_order[lot.id])
+        changed_lots = tuple(changed_lots_list)
         self._changed_lot_ids.clear()
         self._drop_completed_lots()  # 删除已完工的 lot，避免策略每次决策都遍历全部 lot。
+        completion_snapshot = (self._completion_snapshot_ref()
+                               if self._completion_snapshot_ref is not None else None)
+        if completion_snapshot is None:
+            completion_snapshot = CompletionSnapshot(self._last_operation_completion)
+            self._completion_snapshot_ref = weakref.ref(completion_snapshot)
         return StrategyState(
             model=self.model,
             current_time=self.current_time,
-            lots=tuple(self.lots),
-            waiting_lots=tuple(self.order_source.queue),
+            lots=(
+                self.lots.snapshot()
+                if isinstance(self.lots, SnapshotList) else tuple(self.lots)
+            ),
+            waiting_lots=(
+                self.order_source.queue.snapshot()
+                if isinstance(self.order_source.queue, SnapshotDeque)
+                else tuple(self.order_source.queue)
+            ),
             tool_states=self.tool_states,
             waiting_lot_count=len(self.order_source.queue),
-            release_opportunity=release_opportunity,
             event_kinds=tuple(event_kinds or ()),
             strategy_reasons=tuple(reasons or ()),
-            last_operation_completion=dict(self._last_operation_completion),
+            last_operation_completion=completion_snapshot,
             dispatchable_candidates=dispatchable_candidates,
             record_diagnostics=self._plugin_manager.has_decision_plugins,
             changed_lots=changed_lots,

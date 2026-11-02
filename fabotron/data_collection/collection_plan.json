@@ -15,8 +15,8 @@
   "strategies": [
     {"id": "FIFO", "factory": "FIFO", "policy": "FIFO"},
     {"id": "SMT2020", "factory": "SMT2020", "policy": "SMT2020_BASELINE"},
-    {"id": "EDD", "factory": "strategy.edd:EDD", "policy": "EDD"},
-    {"id": "CR", "factory": "strategy.cr:CriticalRatio", "policy": "CR"}
+    {"id": "EDD", "factory": "strategy.legacy.edd:EDD", "policy": "EDD"},
+    {"id": "CR", "factory": "strategy.legacy.cr:CriticalRatio", "policy": "CR"}
   ],
   "tokenizer": {
     "sample_interval_minutes": 360,

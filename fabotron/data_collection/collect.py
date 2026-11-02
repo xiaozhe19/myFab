@@ -111,8 +111,7 @@ def collect_one(request):
             engine.begin_episode(strategy)
             storage.append_extension_data("training_material", "run_metadata", metadata, model.simulation.start_time)
             progress(0, model.simulation.end_time - model.simulation.start_time)
-            while engine.advance_until_release() is not None:
-                engine.apply_release_action(None)
+            engine.advance()
             simulation_result = engine.finish_episode()
             write_json(progress_path, {"job_id": job["id"], "status": "running", "phase": "verifying",
                                        "fraction": 1.0, "elapsed_days": (model.simulation.end_time-model.simulation.start_time)/1440,

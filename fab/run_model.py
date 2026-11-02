@@ -12,7 +12,7 @@ from typing import Callable
 
 from fab.engine import FabEngine
 from fab.model import load_fab_model_from_sqlite
-from strategy.fifo import FIFOStrategy
+from strategy.fifo import FIFORule
 from fab.plugins import PluginManager,FabPlugin
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,11 +33,11 @@ def build_strategy(spec: str, parameters: dict[str, object] | None = None):
     """构造遵守新策略接口的原生策略。"""
 
     if spec == "FIFO":
-        return FIFOStrategy()
+        return FIFORule()
     if spec == "SMT2020":
         from strategy.smt2020_baseline import SMT2020BaselineStrategy
 
-        return SMT2020BaselineStrategy()
+        return SMT2020BaselineStrategy(**(parameters or {}))
     try:
         module_name, class_name = spec.split(":", 1)
     except ValueError as error:

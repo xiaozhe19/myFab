@@ -96,8 +96,8 @@ class TokenizerPlugin(FabPlugin):
         """显式注入只读使用的 Engine 引用，不改变引擎的插件管理器。"""
         if self._engine is not None or self._encoder is not None:
             raise RuntimeError("TokenizerPlugin can only be bound once")
-        if restored and (engine._strategy is None or engine._done or engine._pending is None):
-            raise RuntimeError("restored binding requires an unfinished pending checkpoint")
+        if restored and (engine._strategy is None or engine._done):
+            raise RuntimeError("restored binding requires an unfinished episode")
         if engine._strategy is not None and not restored:
             raise RuntimeError("bind_engine must be called before begin_episode")
         self._engine = engine

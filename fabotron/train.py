@@ -110,9 +110,11 @@ def parse_args(argv=None):
     parser.add_argument("--history-len", type=int, default=8)
     parser.add_argument("--train-fraction", type=float, default=0.7)
     parser.add_argument("--val-fraction", type=float, default=0.15)
-    parser.add_argument("--loss", choices=("v1", "block-mse"), default="v1")
+    parser.add_argument("--loss", choices=("v1", "v1-delta", "block-mse"), default="v1")
     parser.add_argument("--loss-normalization", choices=("training-reference", "none"), default="training-reference")
     parser.add_argument("--smooth-count", type=float, default=1.0, help="Positive smoothing c in Lot units")
+    parser.add_argument("--p-detach-counts", action="store_true",
+                        help="P loss uses predicted W/Q as constants, so P gradients cannot change W/Q")
     for name in ("w", "q", "p", "e"):
         parser.add_argument(f"--lambda-{name}", type=float, default=1.0)
     parser.add_argument("--d-model", type=int, default=64)
@@ -138,6 +140,8 @@ def parse_args(argv=None):
         parser.error("Lengths, batch size, epochs, patience, threads and ff-mult must be positive")
     if args.d_model < 2 or args.d_model % 2:
         parser.error("d-model must be a positive even number for RoPE")
+    if args.loss == "v1-delta" and args.loss_normalization != "training-reference":
+        parser.error("v1-delta fits change variance during calibration; it requires --loss-normalization training-reference")
     if not 0 <= args.dropout < 1 or args.lr <= 0 or args.weight_decay < 0 or args.grad_clip < 0:
         parser.error("Invalid dropout, learning rate, weight decay or gradient clip")
     return args
@@ -174,7 +178,8 @@ def main(argv=None):
         datasets = make_datasets(trajectories, args.history_len, args.train_fraction, args.val_fraction)
     schema = trajectories[0].schema
     objective = TokenStateLoss(schema, mode=args.loss, smooth_count=args.smooth_count,
-                               weights={"W": args.lambda_w, "Q": args.lambda_q, "P": args.lambda_p, "E": args.lambda_e})
+                               weights={"W": args.lambda_w, "Q": args.lambda_q, "P": args.lambda_p, "E": args.lambda_e},
+                               p_detach_counts=args.p_detach_counts)
     if args.loss_normalization == "training-reference":
         objective.calibrate(datasets["train"])
     generator = torch.Generator().manual_seed(args.seed)

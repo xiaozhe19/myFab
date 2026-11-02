@@ -16,7 +16,8 @@ class EventKind(str, Enum):
     # 投料源：ORDER_ARRIVAL 用于旧教学版自动生成；LOT_AVAILABLE 用于外部计划导入。
     ORDER_ARRIVAL = "order_arrival"
     LOT_AVAILABLE = "lot_available"
-    LOT_RELEASE = "lot_release"
+    # 投料员（ReleasePolicy）自己订的闹钟。
+    RELEASE_WAKEUP = "release_wakeup"
 
     # Toolgroups 与 Route_Product_i 的设备占用链。
     LOAD_COMPLETE = "load_complete"
@@ -61,7 +62,7 @@ EVENT_PRIORITY = {
     EventKind.CQT_EXPIRE: 25,
     EventKind.ORDER_ARRIVAL: 30,
     EventKind.LOT_AVAILABLE: 30,
-    EventKind.LOT_RELEASE: 30,
+    EventKind.RELEASE_WAKEUP: 30,
     EventKind.STRATEGY_WAKEUP: 40,
     EventKind.SIMULATION_END: 100,
 }

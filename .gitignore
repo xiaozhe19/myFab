@@ -40,3 +40,5 @@ report-*
 # Local-only: optimization reports and Vanda training tools.
 /OPTIMIZATION_REPORT_*.md
 /training_tools/
+
+experiments

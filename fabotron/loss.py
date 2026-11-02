@@ -12,11 +12,15 @@ PARTS = ("W", "Q", "P_WIP", "P_Queue", "E")
 
 
 class TokenStateLoss(nn.Module):
-    def __init__(self, schema, mode="v1", smooth_count=1.0, weights=None, scales=None):
+    def __init__(self, schema, mode="v1", smooth_count=1.0, weights=None, scales=None, p_detach_counts=False):
         super().__init__()
-        if mode not in ("v1", "block-mse") or not math.isfinite(smooth_count) or smooth_count <= 0:
+        if mode not in ("v1", "v1-delta", "block-mse") or not math.isfinite(smooth_count) or smooth_count <= 0:
             raise ValueError("Invalid loss mode or count smoothing constant")
         self.schema, self.mode, self.smooth_count = schema, mode, smooth_count
+        # P terms compare predicted W/Q x predicted proportions; detaching keeps P gradients off W/Q.
+        self.p_detach_counts = p_detach_counts
+        # v1-delta: per-group variance of the 6h W/Q change, fitted by calibrate() on training labels.
+        self.change_var = None
         self.slices = schema["slices"]
         self.wip_scale = float(schema["normalization"]["W"])
         self.queue_scale = float(schema["normalization"]["Q"])
@@ -68,9 +72,19 @@ class TokenStateLoss(nn.Module):
             result["E"] = (prediction[..., self.equipment_indices] - target[..., self.equipment_indices]).square().mean()
             return result
         predicted, actual = self.state(prediction), self.state(target)
+        if self.p_detach_counts:
+            predicted["P_WIP"] = predicted["W"].detach() * self.block(prediction, "P_WIP")
+            predicted["P_Queue"] = predicted["Q"].detach() * self.block(prediction, "P_Queue")
+        if self.mode == "v1-delta":
+            if self.change_var is None:
+                raise ValueError("v1-delta needs calibrate() to fit per-group change variance")
+            w_den = self.change_var["W"].to(prediction.device) + self.smooth_count
+            q_den = self.change_var["Q"].to(prediction.device) + self.smooth_count
+        else:
+            w_den, q_den = actual["W"] + self.smooth_count, actual["Q"] + self.smooth_count
         return {
-            "W": ((predicted["W"] - actual["W"]).square() / (actual["W"] + self.smooth_count)).mean(),
-            "Q": ((predicted["Q"] - actual["Q"]).square() / (actual["Q"] + self.smooth_count)).mean(),
+            "W": ((predicted["W"] - actual["W"]).square() / w_den).mean(),
+            "Q": ((predicted["Q"] - actual["Q"]).square() / q_den).mean(),
             "P_WIP": (predicted["P_WIP"] - actual["P_WIP"]).abs().mean(),
             "P_Queue": (predicted["P_Queue"] - actual["P_Queue"]).abs().mean(),
             "E": (predicted["E"] - actual["E"]).square().mean(),
@@ -78,7 +92,7 @@ class TokenStateLoss(nn.Module):
 
     def combine(self, parts):
         normalized = {name: parts[name] / self.scales[name] for name in PARTS}
-        if self.mode == "v1":
+        if self.mode in ("v1", "v1-delta"):
             return (self.weights["W"] * normalized["W"] + self.weights["Q"] * normalized["Q"]
                     + 0.5 * self.weights["P"] * (normalized["P_WIP"] + normalized["P_Queue"])
                     + self.weights["E"] * normalized["E"])
@@ -95,15 +109,28 @@ class TokenStateLoss(nn.Module):
 
         For block-mse these are training target mean squares (squared RMS).
         For v1 they have the units of their own weighted-MSE or count-MAE term.
+        v1-delta first fits per-group change variance, then uses persistence (previous
+        snapshot) as the reference instead of a zero state, so every term starts near 1.
         """
-        totals = {name: 0.0 for name in PARTS}
-        count = 0
+        pairs = []
         for index, segment in enumerate(training_dataset.segments):
             start = segment["snapshot_start"] + training_dataset.history_len
             stop = segment["snapshot_stop_exclusive"]
-            labels = training_dataset.trajectories[index].tokens[start:stop]
-            for target in labels.split(32):
-                parts = self.components(torch.zeros_like(target), target)
+            tokens = training_dataset.trajectories[index].tokens
+            pairs.append((tokens[start - 1:stop - 1], tokens[start:stop]))
+        if self.mode == "v1-delta":
+            changes = {"W": [], "Q": []}
+            for previous, labels in pairs:
+                before, after = self.state(previous), self.state(labels)
+                for name in changes:
+                    changes[name].append(after[name] - before[name])
+            self.change_var = {name: torch.cat(values).var(dim=0, unbiased=False) for name, values in changes.items()}
+        totals = {name: 0.0 for name in PARTS}
+        count = 0
+        for previous, labels in pairs:
+            for before, target in zip(previous.split(32), labels.split(32)):
+                reference = before if self.mode == "v1-delta" else torch.zeros_like(target)
+                parts = self.components(reference, target)
                 for name in PARTS:
                     totals[name] += parts[name].item() * len(target)
                 count += len(target)
@@ -112,19 +139,23 @@ class TokenStateLoss(nn.Module):
         for name in PARTS:
             scale = totals[name] / count
             self.scales[name] = scale if scale > 1e-8 else 1.0
-        self.normalization = "training_zero_reference"
+        self.normalization = "training_persistence_reference" if self.mode == "v1-delta" else "training_zero_reference"
         return self.configuration()
 
     def configuration(self):
-        return {"mode": self.mode, "smooth_count_lots": self.smooth_count,
+        reference = "persistence" if self.mode == "v1-delta" else "zero-state"
+        config = {"mode": self.mode, "smooth_count_lots": self.smooth_count, "p_detach_counts": self.p_detach_counts,
                 "weights": dict(self.weights), "scales": dict(self.scales),
                 "normalization": self.normalization,
-                "scale_definition": "Mean zero-state reference loss using training labels only; <=1e-8 uses 1",
+                "scale_definition": f"Mean {reference} reference loss using training labels only; <=1e-8 uses 1",
                 "conservation_weight": 0.0,
                 "ignored_outputs": ["M", "B", "policy", "C.total_tools"],
                 "distribution_definition": (
                     "Per-category Lot MAE; WIP and Queue normalized separately then averaged"
-                    if self.mode == "v1" else "MSE of Tokenizer proportion columns, each block scaled separately")}
+                    if self.mode in ("v1", "v1-delta") else "MSE of Tokenizer proportion columns, each block scaled separately")}
+        if self.change_var is not None:
+            config["change_variance_lots2"] = {name: value.squeeze(-1).tolist() for name, value in self.change_var.items()}
+        return config
 
 
 class StateMetrics:

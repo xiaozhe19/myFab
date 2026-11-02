@@ -1,0 +1,7 @@
+# 仿真器与模型导入
+numpy>=2.3
+openpyxl>=3.1
+# 实验作图（experiments/*/plot_results.py）
+Pillow>=12.0
+# Fabotron 训练（只跑仿真可不装）
+torch>=2.10

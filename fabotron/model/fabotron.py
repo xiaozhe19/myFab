@@ -42,6 +42,6 @@ class Fabotron(nn.Module):
 
         hidden, _ = self.spatial_after(hidden, route_bias=self.route_bias)
         last_hidden = hidden[:, -1]
-        prediction = self.output_head(last_hidden)
+        prediction = x[:, -1] + self.output_head(last_hidden)
 
         return prediction

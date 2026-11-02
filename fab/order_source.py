@@ -1,6 +1,6 @@
 """投料候选 lot 的来源。
 
-来源只负责把 lot 放入 release pool；是否实际进入 fab 始终由策略决定。
+来源只负责把 lot 放入 release pool；是否实际进入 fab 始终由投料员决定。
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from typing import Protocol
 from fab.engine.events import EventKind
 from fab.model.entities import FabModel, LotReleaseSpec, LotState
 from fab.sampling import sample_duration
+from fab.snapshot_collections import SnapshotDeque
 
 
 @dataclass(frozen=True)
@@ -26,10 +27,9 @@ class SourceEvent:
 
 @dataclass(frozen=True)
 class SourceEventResult:
-    """投料源处理事件后的新日历项和是否需要策略投料决策。"""
+    """投料源处理事件后需要放入日历的新事件。"""
 
     next_events: tuple[SourceEvent, ...] = ()
-    release_opportunity: bool = False
 
 
 class LotSource(Protocol):
@@ -38,7 +38,7 @@ class LotSource(Protocol):
     queue: deque[LotState]
 
     def initial_events(
-        self, start_time: float, end_time: float, release_interval: float
+        self, start_time: float, end_time: float
     ) -> tuple[SourceEvent, ...]:
         """返回本次仿真开始时应放入事件日历的供给事件。"""
 
@@ -48,12 +48,11 @@ class LotSource(Protocol):
         kind: EventKind,
         payload: dict[str, object],
         end_time: float,
-        release_interval: float,
     ) -> SourceEventResult | None:
         """处理属于该来源的事件；无关事件返回 ``None``。"""
 
     def release(self, time: float, lot_id: str | None = None) -> LotState | None:
-        """将策略准入的候选 lot 从 release pool 移入 fab。"""
+        """将投料员准入的候选 lot 从 release pool 移入 fab。"""
 
 
 def _pop_or_remove(queue: deque[LotState], lot_id: str | None) -> LotState | None:
@@ -69,25 +68,10 @@ def _pop_or_remove(queue: deque[LotState], lot_id: str | None) -> LotState | Non
     return lot
 
 
-def _next_release_opportunity(
-    time: float, end_time: float, release_interval: float
-) -> SourceEventResult:
-    """安排下一个投料节拍，并标记当前时刻可进行投料决策。"""
-
-    next_time = time + release_interval
-    events = (
-        (SourceEvent(next_time, EventKind.LOT_RELEASE, {}),)
-        if next_time < end_time
-        else ()
-    )
-    return SourceEventResult(events, release_opportunity=True)
-
-
 class SyntheticOrderSource:
     """旧版的自动订单生成器。
 
-    订单按 ``arrival_interval`` 随机生成，策略仍只在 ``release_interval`` 的
-    节拍点决定是否从队首放行一个 lot。
+    订单按 ``arrival_interval`` 随机生成；何时放行由投料员决定。
     """
 
     def __init__(self, model: FabModel, random_seed: int) -> None:
@@ -96,17 +80,14 @@ class SyntheticOrderSource:
         self.model = model
         self.spec = model.synthetic_order
         self.rng = random.Random(random_seed)
-        self.queue: deque[LotState] = deque()
+        self.queue: deque[LotState] = SnapshotDeque()
         self.orders_generated = 0
         self.generated_count = 0
 
     def initial_events(
-        self, start_time: float, _: float, __: float
+        self, start_time: float, _: float
     ) -> tuple[SourceEvent, ...]:
-        return (
-            SourceEvent(start_time, EventKind.ORDER_ARRIVAL, {}),
-            SourceEvent(start_time, EventKind.LOT_RELEASE, {}),
-        )
+        return (SourceEvent(start_time, EventKind.ORDER_ARRIVAL, {}),)
 
     def handle_event(
         self,
@@ -114,7 +95,6 @@ class SyntheticOrderSource:
         kind: EventKind,
         _: dict[str, object],
         end_time: float,
-        release_interval: float,
     ) -> SourceEventResult | None:
         if kind is EventKind.ORDER_ARRIVAL:
             self.generate_order(time)
@@ -125,8 +105,6 @@ class SyntheticOrderSource:
                 else ()
             )
             return SourceEventResult(events)
-        if kind is EventKind.LOT_RELEASE:
-            return _next_release_opportunity(time, end_time, release_interval)
         return None
 
     def generate_order(self, time: float) -> None:
@@ -171,8 +149,8 @@ class ExternalLotReleaseSource:
     """由已导入的 SMT ``LotReleaseSpec`` 生成候选 lot。
 
     每个计划在 ``start_date`` 首次到达，后续到达间隔由其
-    ``release_distribution`` 采样。订单到达只进入 release pool；只有
-    ``LOT_RELEASE`` 节拍才会触发策略的投料决策。
+    ``release_distribution`` 采样。订单到达只进入 release pool；何时放行
+    由投料员决定。
     """
 
     def __init__(self, model: FabModel, random_seed: int) -> None:
@@ -180,15 +158,15 @@ class ExternalLotReleaseSource:
             raise ValueError("external 投料模式必须提供至少一条 lot_releases 规则。")
         self.model = model
         self.rng = random.Random(random_seed)
-        self.queue: deque[LotState] = deque()
+        self.queue: deque[LotState] = SnapshotDeque()
         self._release_counts = [0] * len(model.lot_releases)
         self._generated_count = 0
         self._validate_plans()
 
     def initial_events(
-        self, start_time: float, _: float, __: float
+        self, start_time: float, _: float
     ) -> tuple[SourceEvent, ...]:
-        arrivals = tuple(
+        return tuple(
             SourceEvent(
                 max(start_time, spec.start_date),
                 EventKind.LOT_AVAILABLE,
@@ -196,7 +174,6 @@ class ExternalLotReleaseSource:
             )
             for index, spec in enumerate(self.model.lot_releases)
         )
-        return arrivals + (SourceEvent(start_time, EventKind.LOT_RELEASE, {}),)
 
     def handle_event(
         self,
@@ -204,7 +181,6 @@ class ExternalLotReleaseSource:
         kind: EventKind,
         payload: dict[str, object],
         end_time: float,
-        release_interval: float,
     ) -> SourceEventResult | None:
         if kind is EventKind.LOT_AVAILABLE:
             index = int(payload["plan_index"])
@@ -220,11 +196,9 @@ class ExternalLotReleaseSource:
                 if next_time < end_time
                 else ()
             )
-            # 外部订单到达只更新 release pool。若在这里请求投料决策，
-            # FIFO / EDD / CR 会在每次到达时立即放行，投料节拍就失去意义。
+            # 外部订单到达只更新 release pool；是否放行由订阅了
+            # order_arrival 的投料员决定。
             return SourceEventResult(events)
-        if kind is EventKind.LOT_RELEASE:
-            return _next_release_opportunity(time, end_time, release_interval)
         return None
 
     def _generate_release(self, index: int, spec: LotReleaseSpec, time: float) -> None:
