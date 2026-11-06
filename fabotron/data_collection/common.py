@@ -137,7 +137,7 @@ def prepare_collection(plan):
         raise ValueError("Collection duration must contain a whole number of sampling intervals")
     contract = {"schema": schema, "schema_id": encoder.schema_id, "capture_start_minutes": start,
                 "capture_end_minutes": expected["end_time"], "sample_interval_minutes": interval,
-                "snapshots": round(steps) + 1, "shape": [len(encoder.group_ids), encoder.input_dim],
+                "snapshots": round(steps) + 1, "shape": encoder.shape,
                 "daily_metrics_enabled": bool(plan.get("daily_metrics_plugin")),
                 "raw_event_logs_enabled": False}
     if daily_plugin is not None:
@@ -228,7 +228,7 @@ def validate_daily_metrics(connection, contract):
         start = daily["start_time"] + index * daily["day_minutes"]
         end = min(start + daily["day_minutes"], daily["end_time"])
         duration = end - start
-        if (record["day"] != index + 1 or event_time is None
+        if (record["day"] != daily.get("first_day", 1) + index or event_time is None
                 or not math.isclose(event_time, end, abs_tol=1e-6, rel_tol=0)
                 or any(not math.isclose(record[key], value, abs_tol=1e-6, rel_tol=0)
                        for key, value in (("start_time", start), ("end_time", end), ("duration_minutes", duration)))):
@@ -262,13 +262,21 @@ def validate_daily_metrics(connection, contract):
     return result
 
 
-def validate_database(database, contract, job):
-    """Check every snapshot after its writer has finished; no model inference."""
+def validate_database(database, contract, job, policy_check=None):
+    """Check every snapshot after its writer has finished; no model inference.
+
+    ``policy_check(row_policy) -> bool`` replaces the fixed one-hot check for runs whose
+    per-group policy changes over time (branch collection).
+    """
     database = Path(database).resolve()
     if not database.is_file():
         raise FileNotFoundError(database)
-    groups, features = contract["shape"]
+    from fab.plugins.tokenizer_core import unpack_array
+
     schema = contract["schema"]
+    steps, stages = contract["shape"]["step_counts"]
+    groups, features = contract["shape"]["group_features"]
+    start = contract["capture_start_minutes"]
     with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection:
         if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise ValueError("SQLite quick_check failed")
@@ -288,28 +296,29 @@ def validate_database(database, contract, job):
                                    "AND plugin_name='tokenizer' AND record_type='snapshot'").fetchone()[0]
         if count != contract["snapshots"]:
             raise ValueError(f"Incomplete sampling grid: {count} snapshots, expected {contract['snapshots']}")
-        policy_start, policy_stop = schema["slices"]["policy"]
+        policy_start, policy_stop = schema["group_features"]["slices"]["policy"]
         policy = [float(name == job["strategy"]["policy"]) for name in schema["dispatch_rules"]]
         for index, (event_time, payload) in enumerate(connection.execute(
                 "SELECT event_time,payload_json FROM plugin_records WHERE run_id=1 "
                 "AND plugin_name='tokenizer' AND record_type='snapshot' ORDER BY event_time,record_id")):
             snapshot = json.loads(payload)
-            expected_time = contract["capture_start_minutes"] + index * contract["sample_interval_minutes"]
+            expected_time = start + index * contract["sample_interval_minutes"]
             if (event_time is None or not math.isclose(event_time, expected_time, abs_tol=1e-6, rel_tol=0)
                     or not math.isclose(snapshot["time"], expected_time, abs_tol=1e-6, rel_tol=0)):
                 raise ValueError(f"Invalid sampling timestamp at index {index}")
-            if snapshot["schema_id"] != contract["schema_id"] or snapshot["group_ids"] != schema["group_ids"]:
-                raise ValueError("Group order or schema changed within a run")
-            matrix = snapshot["matrix"]
-            if len(matrix) != groups:
-                raise ValueError("Wrong number of Tool Groups")
-            for row in matrix:
-                if len(row) != features or any(not math.isfinite(value) for value in row):
-                    raise ValueError("Invalid token shape or non-finite features")
-                if row[policy_start:policy_stop] != policy:
+            if snapshot["schema_id"] != contract["schema_id"]:
+                raise ValueError("Schema changed within a run")
+            # 解包本身就检查了长度；计数是 uint16，天然非负。
+            unpack_array(snapshot["step_counts"], "H", steps * stages)
+            values = unpack_array(snapshot["group_features"], "f", groups * features)
+            for g in range(groups):
+                row = values[g * features:(g + 1) * features]
+                if any(not math.isfinite(value) for value in row):
+                    raise ValueError("Non-finite group features")
+                row_policy = list(row[policy_start:policy_stop])
+                if (any(not math.isclose(a, b, abs_tol=1e-6) for a, b in zip(row_policy, policy))
+                        if policy_check is None else not policy_check(row_policy)):
                     raise ValueError("Incorrect strategy one-hot encoding")
-                if any(row[schema["slices"][name][0]] < 0 for name in ("W", "Q")):
-                    raise ValueError("Negative WIP or Queue in captured tokens")
         raw_counts = {table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                       for table in ("operations", "lot_events")}
         if any(raw_counts.values()):
@@ -350,7 +359,8 @@ def training_manifest(path):
     for job in manifest["jobs"]:
         if job["status"] != "complete":
             raise ValueError(f"Collection is incomplete: {job['id']} is {job['status']}")
-        if (job["result"]["run_id"] != 1 or job["result"]["snapshots"] != manifest["contract"]["snapshots"]
+        expected_snapshots = job.get("snapshots", manifest["contract"].get("snapshots"))
+        if (job["result"]["run_id"] != 1 or job["result"]["snapshots"] != expected_snapshots
                 or job["result"]["shape"] != manifest["contract"]["shape"]):
             raise ValueError(f"Inconsistent completion result: {job['id']}")
         database = (path.parent / job["database"]).resolve()

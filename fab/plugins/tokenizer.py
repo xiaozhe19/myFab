@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
 from decimal import Decimal
 import math
 from types import SimpleNamespace
@@ -27,7 +26,7 @@ PERSISTENCE_BASELINE = "current_status_persistence_baseline"
 
 
 class TokenizerPlugin(FabPlugin):
-    """保存完整 Token 和 schema；默认六小时间隔及当前停机状态持续基线。"""
+    """保存 Token（工步表 + 组表，压缩二进制）和 schema；默认六小时间隔及当前停机状态持续基线。"""
 
     def __init__(
         self,
@@ -139,7 +138,7 @@ class TokenizerPlugin(FabPlugin):
         self._storage.append_extension_data(
             plugin_name="tokenizer", record_type="schema", event_time=first,
             payload={
-                "format_version": 1,
+                "format_version": 2,
                 "schema_id": self._encoder.schema_id,
                 "tokenizer_schema": self._encoder.schema(),
                 "sample_interval_minutes": self.sample_interval_minutes,
@@ -210,9 +209,9 @@ class TokenizerPlugin(FabPlugin):
                 plugin_name="tokenizer", record_type="snapshot", event_time=token.time,
                 payload={
                     "time": token.time, "recorded_at": boundary,
-                    "horizon_minutes": token.horizon_minutes, "group_ids": token.group_ids,
-                    "matrix": token.matrix, "counts": [asdict(c) for c in token.counts],
+                    "horizon_minutes": token.horizon_minutes,
                     "schema_id": token.schema_id, "forecast_method": token.forecast_method,
+                    **token.packed(),
                 },
             )
             self._snapshot_count += 1

@@ -74,6 +74,17 @@ class BaseRule:
 
         raise NotImplementedError
 
+    def pair_key(
+        self, lot: LotState, setup: float, tool_rank: int
+    ) -> tuple[object, ...]:
+        """有 setup 的组里 (设备, lot) 配对的完整排序键，值小者先派。
+
+        默认是字典序 (优先级, setup, rank_key, 设备顺序)；混合策略改成把 setup
+        并入打分。
+        """
+
+        return (-lot.priority, setup, *self.rank_key(lot), tool_rank)
+
     # ------------------------------------------------------ 子类可用的工具
 
     @staticmethod
@@ -396,7 +407,7 @@ class BaseRule:
                 setup = self._expected_setup(current, step)
                 # 预留设备优先接收它等待的 super hot lot。
                 tool_rank = -1 if reserved_for == lot.id else rank
-                key = (-lot.priority, setup, *self.rank_key(lot), tool_rank)
+                key = self.pair_key(lot, setup, tool_rank)
                 tool_pairs.append((key, setup, tool, lot))
             if not tool_pairs and blocked_threshold is not None:
                 self._start_blocked_timer(tool.tool_id, blocked_threshold)

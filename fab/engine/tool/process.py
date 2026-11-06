@@ -1,5 +1,7 @@
 """单个设备加工流程"""
 
+from fab.engine.index import dispatch as dispatch_index
+from fab.engine.lot import route as lot_route
 from fab.engine.events import EventKind, SimulationEvent
 from fab.model.entities import LotState, ToolState
 from fab.sampling import sample_duration, sample_duration_sum
@@ -107,7 +109,7 @@ class Process:
         if step.processing_unit == "batch":
             members = engine._batching.select(tool)
             for member in members:
-                engine._remove_ready(member)
+                dispatch_index.remove_ready(engine, member)
                 member.in_process = True
                 member.processing_tool_id = tool.tool_id
                 member.start_time = (
@@ -115,8 +117,11 @@ class Process:
                     if member.start_time is not None
                     else engine.current_time
                 )
+            # 一炉抽一次，走设备的流：组批成员随规则变化，不能用某个 lot 的流。
             duration = sample_duration(
-                engine.rng, step.processing_distribution, step.process_time
+                engine.tool_rng(tool.tool_id, "batch"),
+                step.processing_distribution,
+                step.process_time,
             )
             self.start_phase(
                 tool,
@@ -124,6 +129,7 @@ class Process:
                 EventKind.OPERATION_COMPLETE,
                 lead_time + duration + unloading,
                 process_start=process_start,
+                process_end=process_start + duration,
                 process_time=duration,
                 step_index=lot.operation_index,
                 batch_lots=members,
@@ -145,13 +151,15 @@ class Process:
         ):
             duration = (
                 sample_duration(
-                    engine.rng, step.processing_distribution, step.process_time
+                    engine.lot_rng(lot.id),
+                    step.processing_distribution,
+                    step.process_time,
                 )
                 + (n - 1) * step.cascading_interval
             )
         else:
             duration = sample_duration_sum(
-                engine.rng,
+                engine.lot_rng(lot.id),
                 step.processing_distribution,
                 step.process_time,
                 n,
@@ -181,9 +189,95 @@ class Process:
             EventKind.OPERATION_COMPLETE,
             lead_time + duration + unloading,
             process_start=process_start,
+            process_end=process_start + duration,
             process_time=duration,
             step_index=lot.operation_index,
             activity_token=activity_token,
             next_start=next_start,
         )
+
+
+    def after_operation(self, event: SimulationEvent) -> None:
+        """加工+卸载阶段结束：先按加工结束时刻记账，再执行卸载后的路由。"""
+        engine = self.engine
+        tool, lot, active = engine._current_activity(event)
+        if tool is None or lot is None or active is None:
+            return
+        members = active.get("batch_lots", [lot])
+        step = lot.current_step
+        if step is None:
+            return
+        start = float(event.payload.get("process_start", engine.current_time))
+        # process_start/process_end 在开工时登记；停机恢复时只顺延尚未到达的那个
+        # （见 Downtime.end_downtime），所以卸载中停机不会推迟加工结束时刻。
+        process_end = engine._time(
+            float(
+                event.payload.get(
+                    "process_end",
+                    engine.current_time - engine._unloading_time(tool),
+                )
+            )
+        )
+        # 停机只暂停、不丢失剩余时长，所以实际加工时长就是采样的加工时长。
+        worked = float(event.payload.get("process_time", process_end - start))
+        for member in members:
+            if engine._plugin_manager.has_operation_plugins:
+                engine._plugin_manager.on_operation_completed(
+                    member,
+                    tool,
+                    start,
+                    process_end,
+                    worked,
+                )
+            operation_key = engine._operation_keys_by_product[member.product_id][
+                member.operation_index
+            ]
+            # Outstanding states retain their old version without forcing every
+            # state to copy a table that most strategies never read.
+            if engine._completion_snapshot_ref is not None:
+                engine._detach_completion_snapshot()
+            engine._last_operation_completion[operation_key] = process_end
+            member.last_tool_group_id = step.tool_group_id
+            member.processed_tool_by_step[member.operation_index] = tool.tool_id
+            member.rework_tool_bindings.pop(member.operation_index, None)
+            if step.lot_to_lens_dedication_step:
+                # 绑定工步：把 lot 绑定到当前设备，供 LTL 目标工步（step id）回本机。
+                member.dedicated_tools[step.lot_to_lens_dedication_step] = tool.tool_id
+            elif step.id in member.dedicated_tools:
+                # LTL 目标工步完成，解除该绑定（不影响其他进行中的绑定）。
+                del member.dedicated_tools[step.id]
+            lot_route.schedule_cqt_deadline(engine, member, step, at=process_end)
+            member.operation_index += 1
+            engine._changed_lot_ids.add(member.id)
+            tool.processed_wafers += member.wafer_count
+        tool.current_setup_run_length += 1
+        engine._downtime.schedule_counter_maintenance(tool)
+
+        # 卸载完成：释放槽位，lot 进入下一道工步。
+        token = int(active["token"])
+        tool_activities = engine._active.get(tool.tool_id)
+        if tool_activities is not None:
+            tool_activities.pop(token, None)
+            if not tool_activities:
+                engine._active.pop(tool.tool_id, None)
+        for member in members:
+            member.in_process, member.processing_tool_id = False, None
+            if member.completed:
+                lot_route.complete_lot(engine, member)
+                continue
+            if (
+                engine.lot_rng(member.id).random() < step.rework_probability
+                and step.rework_step
+            ):
+                engine.schedule(
+                    engine.current_time,
+                    EventKind.REWORK_ROUTED,
+                    lot_id=member.id,
+                    step_id=step.rework_step,
+                    end_index=member.operation_index - 1,
+                )
+            else:
+                lot_route.continue_route(engine, member)
+        engine._refresh_tool_capacity(tool)
+        engine._downtime.start_pending_pm_if_idle(tool)
     

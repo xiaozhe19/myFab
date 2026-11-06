@@ -1,9 +1,14 @@
 """处理Tool因为PM或者随机因素的停机"""
 from collections import deque
 
+from fab.engine.index import dispatch as dispatch_index
 from fab.engine.events import EventKind, SimulationEvent
 from fab.sampling import sample_duration
 from fab.model.entities import ToolState,PreventiveMaintenanceSpec
+
+# 活动里以绝对时刻登记、停机恢复时需要顺延的字段。
+_SHIFTED_ON_RESUME = ("process_start", "process_end")
+
 
 class Downtime:
     def __init__(self,engine) -> None:
@@ -35,7 +40,10 @@ class Downtime:
                 next_time,
                 EventKind.PM_DUE,
                 tool_id=event.payload["tool_id"],
-                duration=sample_duration(engine.rng, pm.repair_distribution),
+                duration=sample_duration(
+                    engine.tool_rng(str(event.payload["tool_id"]), f"pm:{pm.event_name}"),
+                    pm.repair_distribution,
+                ),
                 reason=f"pm:{pm.event_name}",
                 pm_event=pm.event_name,
             )
@@ -76,6 +84,7 @@ class Downtime:
                 float(active.get("next_start", active["finish"])) - engine.current_time,
                 0.0,
             )
+            active["paused_at"] = engine.current_time
             paused.append(active)
         if paused:
             # 一次停机使该设备所有旧 token 失效。
@@ -85,7 +94,7 @@ class Downtime:
         tool.in_process = False
         tool.active_lot_id = None
         tool.active_step_id = None
-        engine._mark_busy(tool)
+        dispatch_index.mark_busy(engine, tool)
 
         self.start_downtime(tool, event, completion)
 
@@ -117,12 +126,13 @@ class Downtime:
             if event.kind is EventKind.REPAIR_COMPLETE and event.payload.get("breakdown"):
                 name = str(event.payload["breakdown"])
                 breakdown = engine._breakdowns_by_name[name]
+                rng = engine.tool_rng(tool.tool_id, f"bd:{name}")
                 engine.schedule(
                     engine.current_time
-                    + sample_duration(engine.rng, breakdown.time_to_failure),
+                    + sample_duration(rng, breakdown.time_to_failure),
                     EventKind.BREAKDOWN,
                     tool_id=tool.tool_id,
-                    duration=sample_duration(engine.rng, breakdown.time_to_repair),
+                    duration=sample_duration(rng, breakdown.time_to_repair),
                     reason=f"breakdown:{name}",
                     breakdown=name,
                 )
@@ -151,6 +161,13 @@ class Downtime:
                 return
     
             for paused in paused_activities:
+                # 停机前尚未到达的加工开始/结束时刻顺延停机时长；已过去的保持不变。
+                paused_at = float(paused["paused_at"])
+                shift = engine.current_time - paused_at
+                for key in _SHIFTED_ON_RESUME:
+                    value = paused.get(key)
+                    if value is not None and float(value) > paused_at:
+                        paused[key] = engine._time(float(value) + shift)
                 lot = engine._lot(str(paused["lot_id"]))
                 completion = paused["completion"]
                 if not isinstance(completion, EventKind):
@@ -169,6 +186,7 @@ class Downtime:
                         "remaining",
                         "next_start",
                         "next_start_remaining",
+                        "paused_at",
                         "batch_lots",
                     }
                 }
@@ -233,7 +251,14 @@ class Downtime:
             "constant",
             "deterministic",
         }:
-            return [sample_duration(engine.rng, distribution, fallback) for _ in tools]
+            return [
+                sample_duration(
+                    engine.tool_rng(tool.tool_id, f"pm:{pm.event_name}"),
+                    distribution,
+                    fallback,
+                )
+                for tool in tools
+            ]
         foa = distribution.mean if distribution is not None else fallback
         rank = {
             tool.tool_id: k
@@ -255,7 +280,10 @@ class Downtime:
                     engine.current_time + first,
                     EventKind.PM_DUE,
                     tool_id=tool.tool_id,
-                    duration=sample_duration(engine.rng, pm.repair_distribution),
+                    duration=sample_duration(
+                        engine.tool_rng(tool.tool_id, f"pm:{pm.event_name}"),
+                        pm.repair_distribution,
+                    ),
                     reason=f"pm:{pm.event_name}",
                     pm_event=pm.event_name,
                 )
@@ -271,7 +299,10 @@ class Downtime:
                     engine.current_time,
                     EventKind.PM_DUE,
                     tool_id=tool.tool_id,
-                    duration=sample_duration(engine.rng, pm.repair_distribution),
+                    duration=sample_duration(
+                        engine.tool_rng(tool.tool_id, f"pm:{pm.event_name}"),
+                        pm.repair_distribution,
+                    ),
                     reason=f"pm:{pm.event_name}",
                     pm_event=pm.event_name,
                 )
@@ -285,19 +316,18 @@ class Downtime:
             for tool in self.matching_tools(
                 breakdown.valid_for_type, breakdown.type_name
             ):
+                rng = engine.tool_rng(tool.tool_id, f"bd:{breakdown.event_name}")
                 if breakdown.first_one_at_distribution is not None:
-                    first = sample_duration(
-                        engine.rng, breakdown.first_one_at_distribution
-                    )
+                    first = sample_duration(rng, breakdown.first_one_at_distribution)
                 elif breakdown.first_one_at is not None:
                     first = breakdown.first_one_at
                 else:
-                    first = sample_duration(engine.rng, breakdown.time_to_failure)
+                    first = sample_duration(rng, breakdown.time_to_failure)
                 engine.schedule(
                     engine.current_time + first,
                     EventKind.BREAKDOWN,
                     tool_id=tool.tool_id,
-                    duration=sample_duration(engine.rng, breakdown.time_to_repair),
+                    duration=sample_duration(rng, breakdown.time_to_repair),
                     reason=f"breakdown:{breakdown.event_name}",
                     breakdown=breakdown.event_name,
                 )

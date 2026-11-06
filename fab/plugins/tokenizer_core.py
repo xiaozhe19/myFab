@@ -1,20 +1,27 @@
-"""Tool Group Token V1 的特征计算，由 TokenizerPlugin 调用。
+"""Tool Group Token V2 的特征计算，由 TokenizerPlugin 调用。
 
-Recipe defaults to product_id (the product's processing recipe). Re-entry is
-the static route visit ordinal of the exact tool_group_id, not process/area.
+一张快照 = 工步表 [工步数, 阶段数]（每个路线工步上各阶段的 lot 数）+ 组表
+[组数, 组特征维数]（设备状态 C、PM 预报 M、故障预报 B、策略 policy）。组级的
+WIP/Queue 与组内分布都可由工步表按静态路线求和得到
+（见 fabotron/layout.py），因此不重复存储。
+
 Only current activities, paused activities, frozen batches and ready indexes
 are inspected. The event calendar and all random generators are untouched.
 """
 
 from __future__ import annotations
 
+from array import array
+import base64
 from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
 import math
+import sys
 from typing import Mapping, Sequence
+import zlib
 
 from fab.engine.eligibility import tool_is_available
 from fab.engine.engine import FabEngine
@@ -94,53 +101,63 @@ class DowntimeForecast:
 
 
 @dataclass(frozen=True)
-class GroupCounts:
-    """Unnormalized counts, for auditing and lossless count recovery."""
-
-    wip: int
-    queue: int
-    total_tools: int
-    available_tools: int
-    occupied_slots: int
-    down_tools: int
-
-
-@dataclass(frozen=True)
 class TokenizedFab:
+    """一张快照：工步表（每个工步各阶段的 lot 数）+ 组表（设备、预报、策略）。
+
+    两张表都是行优先展平的一维数组：step_counts 为 uint16，长度 = 工步数 × 阶段数；
+    group_features 为 float32，长度 = 组数 × 组特征维数。
+    """
+
     time: float
     horizon_minutes: float
-    group_ids: tuple[str, ...]
-    matrix: tuple[tuple[float, ...], ...]
-    counts: tuple[GroupCounts, ...]
+    step_counts: array
+    group_features: array
     schema_id: str
     forecast_method: str
 
-    @property
-    def shape(self) -> tuple[int, int]:
-        return len(self.group_ids), len(self.matrix[0])
+    def packed(self) -> dict[str, str]:
+        return {"step_counts": pack_array(self.step_counts),
+                "group_features": pack_array(self.group_features)}
 
-    def as_numpy(self):
-        """Optional NumPy bridge; core tokenizer has no third-party dependency."""
-        import numpy as np
 
-        return np.asarray(self.matrix, dtype=np.float32)
+def pack_array(values: array) -> str:
+    """小端字节 -> zlib -> base64 文本（SQLite 的扩展记录只收 JSON）。"""
+
+    if sys.byteorder != "little":
+        values = array(values.typecode, values)
+        values.byteswap()
+    return base64.b64encode(zlib.compress(values.tobytes(), 6)).decode("ascii")
+
+
+def unpack_array(text: str, typecode: str, length: int) -> array:
+    values = array(typecode)
+    values.frombytes(zlib.decompress(base64.b64decode(text)))
+    if sys.byteorder != "little":
+        values.byteswap()
+    if len(values) != length:
+        raise ValueError(f"packed array has {len(values)} values, expected {length}")
+    return values
+
+
+# 组表 C 块的列（都按台数，分母 = 总台数）
+C_COLUMNS = ("total_tools", "idle_tools", "busy_tools", "down_tools")
 
 
 class ToolGroupTokenizer:
-    """Encode engine.current_time using frozen static category indexes.
+    """按静态路线把当前时刻编码成工步表 + 组表（Tool Group Token V2）。
 
-    All groups share the same global (Recipe, Re-entry) vocabulary, including
-    zeros for inapplicable categories. recipe_by_step optionally overrides the
-    default product recipes with an exhaustive {(product_id, route_index): id}
-    mapping. Route indexes are zero-based; re-entry ordinals start at one.
+    工步 = (产品, 路线下标)，按产品名、下标排序，所有快照顺序相同。每个工步固定属于
+    一个设备组；组的 WIP/Queue 等于其工步之和，所以不再单独存。schema 里的
+    ``steps`` 记录每个工步的 [产品, 下标, 组, recipe, 第几次到访该组]，训练端据此
+    还原旧的 (Recipe, Re-entry) 视图。recipe_by_step 可覆盖默认 recipe（= 产品名）。
+
+    阶段：Ready（在队列）、Transport、Setup、Processing[剩余时长分档]。引擎已把
+    装卸合并进加工，不存在 Loading/Unloading 活动；遇到未知活动阶段直接报错。
     """
 
-    _STAGES = ("Ready", "Transport", "Loading", "Setup", "Unloading")
-    _PHASES = {
-        EventKind.LOAD_COMPLETE: "Loading",
-        EventKind.SETUP_COMPLETE: "Setup",
-        EventKind.UNLOAD_COMPLETE: "Unloading",
-    }
+    _STAGES = ("Ready", "Transport", "Setup")
+    _PHASES = {EventKind.SETUP_COMPLETE: "Setup"}
+    VERSION = "tool-group-token-v2"
 
     def __init__(
         self,
@@ -165,9 +182,6 @@ class ToolGroupTokenizer:
             spec = model.tool_groups[group]
             self._tool_capacities[tool_id] = max(1, spec.cascading_capacity) if spec.cascading_tool else 1
         self._total_tools = Counter(self._tool_groups.values())
-        self._total_slots = Counter()
-        for tool_id, group in self._tool_groups.items():
-            self._total_slots[group] += self._tool_capacities[tool_id]
         for group in self.group_ids:
             if self._total_tools[group] != model.tool_groups[group].number_of_tools:
                 raise ValueError(f"{group}: tool specs do not match number_of_tools")
@@ -175,8 +189,7 @@ class ToolGroupTokenizer:
         coordinates = {(p, i) for p, route in self._routes.items() for i in range(len(route))}
         if recipe_by_step is not None and set(recipe_by_step) != coordinates:
             raise ValueError("recipe_by_step must cover every static route coordinate exactly")
-        self._route_categories = {}
-        self._recipes = {}
+        steps = []
         for product_id in sorted(self._routes):
             visits: Counter[str] = Counter()
             for index, step in enumerate(self._routes[product_id]):
@@ -186,17 +199,15 @@ class ToolGroupTokenizer:
                 recipe = product_id if recipe_by_step is None else recipe_by_step[(product_id, index)]
                 if not isinstance(recipe, str) or not recipe:
                     raise ValueError("Recipe IDs must be nonempty strings")
-                self._recipes[(product_id, index)] = recipe
-                self._route_categories[(product_id, index)] = (recipe, visits[step.tool_group_id])
+                steps.append((product_id, index, step.tool_group_id, recipe, visits[step.tool_group_id]))
+        self.steps = tuple(steps)
+        self._step_index = {(step[0], step[1]): k for k, step in enumerate(self.steps)}
         self.recipe_source = "product_id" if recipe_by_step is None else "explicit_static_mapping"
-        self.pair_categories = tuple(sorted(set(self._route_categories.values())))
-        self._pairs = {pair: i for i, pair in enumerate(self.pair_categories)}
         self.stages = self._STAGES + tuple(
             f"Processing[{i}]" for i in range(len(config.processing_edges_minutes) + 1))
         self._stages = {stage: i for i, stage in enumerate(self.stages)}
         sizes = (
-            ("W", 1), ("P_WIP", len(self.pair_categories) * len(self.stages)),
-            ("Q", 1), ("P_Queue", len(self.pair_categories)), ("C", 4),
+            ("C", 4),
             ("M", len(config.downtime_ratio_edges) + 1),
             ("B", len(config.downtime_ratio_edges) + 1),
             ("policy", len(config.dispatch_rules)),
@@ -206,28 +217,36 @@ class ToolGroupTokenizer:
         for name, size in sizes:
             self._slices[name] = slice(offset, offset + size)
             offset += size
-        self.input_dim = offset
+        self.group_dim = offset
         self.schema_id = hashlib.sha256(json.dumps(
             self.schema(), sort_keys=True, ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")).hexdigest()
 
     @property
     def slices(self) -> dict[str, slice]:
+        """组表各块在组特征维上的位置。"""
         return dict(self._slices)
+
+    @property
+    def shape(self) -> dict[str, list[int]]:
+        return {"step_counts": [len(self.steps), len(self.stages)],
+                "group_features": [len(self.group_ids), self.group_dim]}
 
     def schema(self) -> dict:
         """JSON-serializable column contract to save next to training data."""
         return {
-            "version": "tool-group-token-v1",
+            "version": self.VERSION,
             "group_ids": self.group_ids,
             "recipe_source": self.recipe_source,
-            "route_categories": [
-                [p, i, self._routes[p][i].tool_group_id, *self._route_categories[(p, i)]]
-                for p, i in sorted(self._route_categories)
-            ],
-            "pair_categories": self.pair_categories,
+            "steps": self.steps,
+            "step_columns": ("product_id", "route_index", "tool_group_id", "recipe", "visit"),
             "stages": self.stages,
-            "wip_flattening": "pair-major, stage-minor",
+            "step_counts": {"dtype": "uint16", "shape": self.shape["step_counts"],
+                            "layout": "step-major, stage-minor", "unit": "lots"},
+            "group_features": {"dtype": "float32", "shape": self.shape["group_features"],
+                               "layout": "group-major, feature-minor",
+                               "slices": {k: [v.start, v.stop] for k, v in self._slices.items()}},
+            "packing": "little-endian bytes, zlib, base64",
             "processing_edges_minutes": self.config.processing_edges_minutes,
             "downtime_ratio_edges": self.config.downtime_ratio_edges,
             "intervals": "left-closed, right-open; last includes upper endpoint",
@@ -235,15 +254,14 @@ class ToolGroupTokenizer:
             "horizon_minutes": self.config.horizon_minutes,
             "normalization": {
                 "W": self.config.wip_scale, "Q": self.config.queue_scale,
-                "C": [[g, self._total_tools[g], self._total_tools[g],
-                       self._total_slots[g], self._total_tools[g]] for g in self.group_ids],
+                "C": [[g, *([self._total_tools[g]] * 4)] for g in self.group_ids],
                 "zero_capacity_divisor": 1,
                 "clipping": False,
             },
-            "C_columns": ("total_tools", "available_tools", "occupied_slots", "down_tools"),
-            "occupied_slots": "active plus paused activities; one slot per batch/cascade activity",
-            "slices": {k: [v.start, v.stop] for k, v in self._slices.items()},
-            "input_dim": self.input_dim,
+            "C_columns": C_COLUMNS,
+            "C_semantics": ("tool counts / total tools; idle + busy + down = total. idle = can accept "
+                            "a new lot now (eligibility.tool_is_available); down = is_down (a tool paused "
+                            "mid-process counts as down only); busy = neither"),
         }
 
     def _check_engine(self, engine: FabEngine) -> None:
@@ -295,7 +313,6 @@ class ToolGroupTokenizer:
         if len(lots) != len(engine.lots):
             raise ValueError("duplicate lot IDs in engine.lots")
         assignments: dict[str, tuple[str, int, str]] = {}
-        occupied: Counter[str] = Counter()
 
         def assign(lot: LotState, group: str, index: int, stage: str) -> None:
             if lot.id not in lots or lots[lot.id] is not lot:
@@ -304,14 +321,12 @@ class ToolGroupTokenizer:
                 raise ValueError(f"{lot.id}: route position does not match static schema")
             if lot.route[index].tool_group_id != group:
                 raise ValueError(f"{lot.id}: service/route group mismatch at operation {index}")
-            value = (group, index, stage)
             if lot.id in assignments:
                 raise ValueError(f"{lot.id}: duplicate activity/queue membership")
-            assignments[lot.id] = value
+            assignments[lot.id] = (lot.product_id, index, stage)
 
         def activity(tool_id: str, record: dict, paused: bool) -> None:
             group = self._tool_groups[tool_id]
-            occupied[group] += 1
             completion = record["completion"]
             if completion == EventKind.OPERATION_COMPLETE:
                 remaining = float(record["remaining"]) if paused else float(record["finish"]) - now
@@ -323,13 +338,11 @@ class ToolGroupTokenizer:
                 if stage is None:
                     raise ValueError(f"unsupported activity phase {completion}")
             members = record.get("batch_lots") or [lots[str(record["lot_id"])]]
-            # Frozen members have not yet been marked in_process during loading/setup.
-            if completion in (EventKind.LOAD_COMPLETE, EventKind.SETUP_COMPLETE):
+            # Frozen members have not yet been marked in_process during setup.
+            if completion == EventKind.SETUP_COMPLETE:
                 members = (engine._pending_batches or {}).get(tool_id) or members
             for lot in members:
-                # Engine advances each member's route BEFORE unloading, including final unload.
-                index = lot.operation_index - (completion == EventKind.UNLOAD_COMPLETE)
-                assign(lot, group, index, stage)
+                assign(lot, group, lot.operation_index, stage)
 
         for tool_id, records in engine._active.items():
             for record in records.values():
@@ -355,36 +368,34 @@ class ToolGroupTokenizer:
                 raise ValueError(f"{lot.id}: unresolved route transition; use a settled event boundary")
             assign(lot, group, lot.operation_index, stage)
 
-        wip_hist = [[0] * (len(self.pair_categories) * len(self.stages)) for _ in self.group_ids]
-        queue_hist = [[0] * len(self.pair_categories) for _ in self.group_ids]
-        for lot_id, (group, index, stage) in assignments.items():
-            lot = lots[lot_id]
-            row = self._groups[group]
-            pair = self._pairs[self._route_categories[(lot.product_id, index)]]
-            wip_hist[row][pair * len(self.stages) + self._stages[stage]] += 1
-            if stage == "Ready":
-                queue_hist[row][pair] += 1
+        width = len(self.stages)
+        counts = array("H", bytes(2 * len(self.steps) * width))
+        for product_id, index, stage in assignments.values():
+            position = self._step_index[(product_id, index)] * width + self._stages[stage]
+            if counts[position] == 0xFFFF:
+                raise OverflowError("more than 65535 lots in one step/stage cell")
+            counts[position] += 1
 
-        available: Counter[str] = Counter()
+        # 三种状态互斥、按台数计：空闲（能马上接新 lot）/ 停机 / 忙（其余）
+        idle: Counter[str] = Counter()
+        busy: Counter[str] = Counter()
         down: Counter[str] = Counter()
         for tool_id, tool in engine.tool_states.items():
             group = self._tool_groups[tool_id]
-            available[group] += tool_is_available(tool, now)
-            down[group] += tool.is_down
-        rows, counts = [], []
-        for row, group in enumerate(self.group_ids):
-            w, q = sum(wip_hist[row]), sum(queue_hist[row])
+            if tool.is_down:
+                down[group] += 1
+            elif tool_is_available(tool, now):
+                idle[group] += 1
+            else:
+                busy[group] += 1
+        features = array("f")
+        for group in self.group_ids:
             total = self._total_tools[group]
-            counts.append(GroupCounts(w, q, total, available[group], occupied[group], down[group]))
-            c = (total / max(1, total), available[group] / max(1, total),
-                 occupied[group] / max(1, self._total_slots[group]), down[group] / max(1, total))
-            rows.append((w / self.config.wip_scale,
-                         *(n / w if w else 0.0 for n in wip_hist[row]),
-                         q / self.config.queue_scale,
-                         *(n / q if q else 0.0 for n in queue_hist[row]),
-                         *c, *pm[group], *bd[group], *policies[group]))
-        return TokenizedFab(now, self.config.horizon_minutes, self.group_ids,
-                            tuple(rows), tuple(counts), self.schema_id, forecast.method)
+            features.extend((total / max(1, total), idle[group] / max(1, total),
+                             busy[group] / max(1, total), down[group] / max(1, total),
+                             *pm[group], *bd[group], *policies[group]))
+        return TokenizedFab(now, self.config.horizon_minutes, counts, features,
+                            self.schema_id, forecast.method)
 
 
 def current_status_forecast(

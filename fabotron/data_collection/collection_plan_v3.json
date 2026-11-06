@@ -1,0 +1,107 @@
+{
+ "version": 3,
+ "model_database": "data/model/fab_model.sqlite",
+ "output_dir": "data/result/branches_v3_40seed",
+ "warm_cache_dir": "data/result/warm_cache",
+ "hot_groups_config": "strategy/config/hot_groups_smt2020.json",
+ "simulation": {
+  "start_time": 0,
+  "warmup_days": 365
+ },
+ "seed_splits": {
+  "train": [
+   2026110400,
+   2026110401,
+   2026110402,
+   2026110403,
+   2026110404,
+   2026110405,
+   2026110406,
+   2026110407,
+   2026110408,
+   2026110409,
+   2026110410,
+   2026110411,
+   2026110412,
+   2026110413,
+   2026110414,
+   2026110415,
+   2026110416,
+   2026110417,
+   2026110418,
+   2026110419,
+   2026110420,
+   2026110421,
+   2026110422,
+   2026110423,
+   2026110424,
+   2026110425,
+   2026110426,
+   2026110427,
+   2026110428,
+   2026110429
+  ],
+  "validation": [
+   2026110430,
+   2026110431,
+   2026110432,
+   2026110433,
+   2026110434
+  ],
+  "test": [
+   2026110435,
+   2026110436,
+   2026110437,
+   2026110438,
+   2026110439
+  ]
+ },
+ "bd_lead_days": 7,
+ "tree": [
+  {
+   "name": "B",
+   "from": "warm",
+   "branches": 4,
+   "days": 240
+  },
+  {
+   "name": "E",
+   "from": "warm",
+   "branches": 16,
+   "hours": 72,
+   "eval": true,
+   "policy": "shared"
+  }
+ ],
+ "sampler": {
+  "mix": [
+   0.3333333333333333,
+   0.3333333333333333,
+   0.3333333333333334
+  ],
+  "hold_updates": [
+   4,
+   12
+  ],
+  "near_fifo_sa_noise": 0.2
+ },
+ "tokenizer": {
+  "sample_interval_minutes": 360,
+  "horizon_minutes": 360,
+  "processing_edges_minutes": [
+   30,
+   60,
+   120
+  ],
+  "downtime_ratio_edges": [
+   0.05,
+   0.1,
+   0.2
+  ],
+  "wip_scale": 100,
+  "queue_scale": 100
+ },
+ "workers": 40,
+ "daily_metrics_plugin": "fab.plugins.daily_metrics:DailyMetricsPlugin",
+ "keep_checkpoints": false
+}

@@ -1,213 +1,202 @@
-"""Candidate state losses. Context/controls and static capacity are not targets."""
+"""离散分布的训练目标（交叉熵）和评估指标。
+
+loss = λ_C·mean(三列 C 的 CE) + λ_W·CE(ΔW 区间) + λ_Q·CE(ΔQ 区间) + λ_P·组内比例的每 lot NLL
+
+单位都是 nats（自然对数）。组内比例的 NLL = −Σ_格子 下一帧 lot 数 × log 预测比例，
+再除以下一帧总 lot 数，即"每个 lot 落在它真实格子里的平均 −log 概率"。
+"""
 
 from __future__ import annotations
 
-import math
-
 import torch
+import torch.nn.functional as F
 from torch import nn
 
+PARTS = ("C", "W", "Q", "P")
 
-PARTS = ("W", "Q", "P_WIP", "P_Queue", "E")
+
+def cross_entropy(logits, target):
+    return F.cross_entropy(logits.reshape(-1, logits.shape[-1]), target.reshape(-1))
 
 
-class TokenStateLoss(nn.Module):
-    def __init__(self, schema, mode="v1", smooth_count=1.0, weights=None, scales=None, p_detach_counts=False):
+def composition_nll(logits, cells1, *, total=False):
+    nll = -(cells1 * logits.log_softmax(-1)).sum()
+    lots = cells1.sum()
+    return (nll, lots) if total else nll / lots.clamp(min=1)
+
+
+class FabotronLoss(nn.Module):
+    def __init__(self, weights=None):
         super().__init__()
-        if mode not in ("v1", "v1-delta", "block-mse") or not math.isfinite(smooth_count) or smooth_count <= 0:
-            raise ValueError("Invalid loss mode or count smoothing constant")
-        self.schema, self.mode, self.smooth_count = schema, mode, smooth_count
-        # P terms compare predicted W/Q x predicted proportions; detaching keeps P gradients off W/Q.
-        self.p_detach_counts = p_detach_counts
-        # v1-delta: per-group variance of the 6h W/Q change, fitted by calibrate() on training labels.
-        self.change_var = None
-        self.slices = schema["slices"]
-        self.wip_scale = float(schema["normalization"]["W"])
-        self.queue_scale = float(schema["normalization"]["Q"])
-        if any(not math.isfinite(v) or v <= 0 for v in (self.wip_scale, self.queue_scale)):
-            raise ValueError("Tokenizer count scales must be finite and positive")
-        if any(self.slices[name][1] - self.slices[name][0] != 1 for name in ("W", "Q")):
-            raise ValueError("W and Q must each contain one scalar")
-        columns = schema["C_columns"]
-        start, stop = self.slices["C"]
-        if stop - start != len(columns):
-            raise ValueError("C_columns do not match the equipment slice")
-        self.equipment_indices = [start + columns.index(name) for name in
-                                  ("available_tools", "occupied_slots", "down_tools")]
-        self.weights = {"W": 1.0, "Q": 1.0, "P": 1.0, "E": 1.0}
+        self.weights = {name: 1.0 for name in PARTS}
         if weights:
-            if set(weights) - set(self.weights):
+            if set(weights) - set(PARTS):
                 raise ValueError("Unknown loss weights")
             self.weights.update(weights)
-        if any(not math.isfinite(v) or v < 0 for v in self.weights.values()) or not sum(self.weights.values()):
-            raise ValueError("Loss weights must be finite, nonnegative, and not all zero")
-        self.scales = {name: 1.0 for name in PARTS}
-        self.normalization = "none"
-        if scales is not None:
-            if set(scales) != set(PARTS) or any(not math.isfinite(v) or v <= 0 for v in scales.values()):
-                raise ValueError("Invalid fitted loss scales")
-            self.scales.update(scales)
-            self.normalization = "provided_scales"
+        if any(v < 0 for v in self.weights.values()) or not sum(self.weights.values()):
+            raise ValueError("Loss weights must be nonnegative and not all zero")
 
-    def block(self, token, name):
-        start, end = self.slices[name]
-        return token[..., start:end]
-
-    def state(self, token):
-        wip = self.block(token, "W") * self.wip_scale
-        queue = self.block(token, "Q") * self.queue_scale
-        return {
-            "W": wip, "Q": queue,
-            "P_WIP": wip * self.block(token, "P_WIP"),
-            "P_Queue": queue * self.block(token, "P_Queue"),
-            "E": token[..., self.equipment_indices],
-        }
-
-    def components(self, prediction, target):
-        if prediction.shape != target.shape or prediction.shape[-1] != self.schema["input_dim"]:
-            raise ValueError("Prediction and complete target-token shapes must agree")
-        if self.mode == "block-mse":
-            result = {name: (self.block(prediction, name) - self.block(target, name)).square().mean()
-                      for name in PARTS if name != "E"}
-            result["E"] = (prediction[..., self.equipment_indices] - target[..., self.equipment_indices]).square().mean()
-            return result
-        predicted, actual = self.state(prediction), self.state(target)
-        if self.p_detach_counts:
-            predicted["P_WIP"] = predicted["W"].detach() * self.block(prediction, "P_WIP")
-            predicted["P_Queue"] = predicted["Q"].detach() * self.block(prediction, "P_Queue")
-        if self.mode == "v1-delta":
-            if self.change_var is None:
-                raise ValueError("v1-delta needs calibrate() to fit per-group change variance")
-            w_den = self.change_var["W"].to(prediction.device) + self.smooth_count
-            q_den = self.change_var["Q"].to(prediction.device) + self.smooth_count
-        else:
-            w_den, q_den = actual["W"] + self.smooth_count, actual["Q"] + self.smooth_count
-        return {
-            "W": ((predicted["W"] - actual["W"]).square() / w_den).mean(),
-            "Q": ((predicted["Q"] - actual["Q"]).square() / q_den).mean(),
-            "P_WIP": (predicted["P_WIP"] - actual["P_WIP"]).abs().mean(),
-            "P_Queue": (predicted["P_Queue"] - actual["P_Queue"]).abs().mean(),
-            "E": (predicted["E"] - actual["E"]).square().mean(),
-        }
+    def components(self, outputs, targets):
+        # C：所有 (组, 列) 的 CE 平均；每个档单独算，再按个数合并
+        c_sum = sum(F.cross_entropy(logits.reshape(-1, logits.shape[-1]), classes.reshape(-1), reduction="sum")
+                    for logits, classes in zip(outputs["c"], outputs["c_class"]))
+        c_count = sum(classes.numel() for classes in outputs["c_class"])
+        return {"C": c_sum / max(1, c_count), "W": cross_entropy(outputs["w"], targets["w_bin"]),
+                "Q": cross_entropy(outputs["q"], targets["q_bin"]),
+                "P": composition_nll(outputs["comp"], targets["cells1"])}
 
     def combine(self, parts):
-        normalized = {name: parts[name] / self.scales[name] for name in PARTS}
-        if self.mode in ("v1", "v1-delta"):
-            return (self.weights["W"] * normalized["W"] + self.weights["Q"] * normalized["Q"]
-                    + 0.5 * self.weights["P"] * (normalized["P_WIP"] + normalized["P_Queue"])
-                    + self.weights["E"] * normalized["E"])
-        weights = {"W": self.weights["W"], "Q": self.weights["Q"],
-                   "P_WIP": self.weights["P"], "P_Queue": self.weights["P"], "E": self.weights["E"]}
-        return sum(weights[name] * normalized[name] for name in PARTS) / sum(weights.values())
+        return sum(self.weights[name] * parts[name] for name in PARTS)
 
-    def forward(self, prediction, target):
-        return self.combine(self.components(prediction, target))
-
-    @torch.no_grad()
-    def calibrate(self, training_dataset):
-        """Use only training labels; zero-state reference defines each typical loss scale.
-
-        For block-mse these are training target mean squares (squared RMS).
-        For v1 they have the units of their own weighted-MSE or count-MAE term.
-        v1-delta first fits per-group change variance, then uses persistence (previous
-        snapshot) as the reference instead of a zero state, so every term starts near 1.
-        """
-        pairs = []
-        for index, segment in enumerate(training_dataset.segments):
-            start = segment["snapshot_start"] + training_dataset.history_len
-            stop = segment["snapshot_stop_exclusive"]
-            tokens = training_dataset.trajectories[index].tokens
-            pairs.append((tokens[start - 1:stop - 1], tokens[start:stop]))
-        if self.mode == "v1-delta":
-            changes = {"W": [], "Q": []}
-            for previous, labels in pairs:
-                before, after = self.state(previous), self.state(labels)
-                for name in changes:
-                    changes[name].append(after[name] - before[name])
-            self.change_var = {name: torch.cat(values).var(dim=0, unbiased=False) for name, values in changes.items()}
-        totals = {name: 0.0 for name in PARTS}
-        count = 0
-        for previous, labels in pairs:
-            for before, target in zip(previous.split(32), labels.split(32)):
-                reference = before if self.mode == "v1-delta" else torch.zeros_like(target)
-                parts = self.components(reference, target)
-                for name in PARTS:
-                    totals[name] += parts[name].item() * len(target)
-                count += len(target)
-        if not count:
-            raise ValueError("Cannot calibrate using an empty training set")
-        for name in PARTS:
-            scale = totals[name] / count
-            self.scales[name] = scale if scale > 1e-8 else 1.0
-        self.normalization = "training_persistence_reference" if self.mode == "v1-delta" else "training_zero_reference"
-        return self.configuration()
+    def forward(self, outputs, targets):
+        parts = self.components(outputs, targets)
+        return self.combine(parts), parts
 
     def configuration(self):
-        reference = "persistence" if self.mode == "v1-delta" else "zero-state"
-        config = {"mode": self.mode, "smooth_count_lots": self.smooth_count, "p_detach_counts": self.p_detach_counts,
-                "weights": dict(self.weights), "scales": dict(self.scales),
-                "normalization": self.normalization,
-                "scale_definition": f"Mean {reference} reference loss using training labels only; <=1e-8 uses 1",
-                "conservation_weight": 0.0,
-                "ignored_outputs": ["M", "B", "policy", "C.total_tools"],
-                "distribution_definition": (
-                    "Per-category Lot MAE; WIP and Queue normalized separately then averaged"
-                    if self.mode in ("v1", "v1-delta") else "MSE of Tokenizer proportion columns, each block scaled separately")}
-        if self.change_var is not None:
-            config["change_variance_lots2"] = {name: value.squeeze(-1).tolist() for name, value in self.change_var.items()}
-        return config
+        return {"weights": dict(self.weights), "units": "nats",
+                "C": ("mean CE over (group, column); class = integer change within the group's tier "
+                      "(tier >= 1.25x the largest training change + 1); infeasible masked; larger changes clamp to the edge"),
+                "W/Q": "CE over 21 sigma-scaled bins of the 6h change",
+                "P": "per-lot NLL of the next-frame cell composition within each group"}
+
+
+def median_value(coder, which, probs):
+    """离散分布的中位数区间 -> 代表值 Δ（lot）。MAE 的最优点估计是中位数。"""
+    bins = (probs.cumsum(-1) < 0.5).sum(-1).clamp(max=probs.shape[-1] - 1)
+    return coder.values(which, bins)
+
+
+def mean_value(coder, which, probs):
+    return (probs * coder.bin_values[which]).sum(-1)
+
+
+COVERAGE_LEVELS = (0.5, 0.8, 0.9)
+PIT_BINS = 10
+
+
+def crps_discrete(probs, atoms, y):
+    """离散分布（原子 atoms、概率 probs，[..., K]）对真实值 y [...] 的 CRPS。
+
+    CRPS = E|X − y| − ½·E|X − X'|。点分布时就是 |x − y|，所以和 MAE 同单位、可直接比。
+    """
+    first = (probs * (atoms - y.unsqueeze(-1)).abs()).sum(-1)
+    pair = (atoms.unsqueeze(-1) - atoms.unsqueeze(-2)).abs()                    # [..., K, K]
+    second = torch.einsum("...j,...jk,...k->...", probs, pair, probs)
+    return first - 0.5 * second
+
+
+def pit_overlap(probs, true_bin, low, high):
+    """随机化 PIT 落在 [low, high] 的期望概率（对 U 取期望，无随机数）。
+
+    类别分布的 PIT = F(真实区间之前) + U·p(真实区间)，U~均匀(0,1)，即在 [F−, F] 上均匀。
+    校准良好时 PIT ~ 均匀(0,1)，所以落进中间 c 的比例应 = c。
+    """
+    cdf = probs.cumsum(-1)
+    upper = cdf.gather(-1, true_bin.unsqueeze(-1)).squeeze(-1)
+    p = probs.gather(-1, true_bin.unsqueeze(-1)).squeeze(-1)
+    lower = upper - p
+    overlap = (torch.minimum(upper, torch.as_tensor(high)) - torch.maximum(lower, torch.as_tensor(low))).clamp(min=0)
+    point = ((lower >= low) & (lower < high)).float()
+    return torch.where(p > 1e-9, overlap / p.clamp(min=1e-9), point)
+
+
+def central_width(probs, atoms, level):
+    """中间 level 区间 [q_(1−level)/2, q_(1+level)/2] 的宽度（lot），衡量分布有多"尖"。"""
+    cdf = probs.cumsum(-1)
+    last = probs.shape[-1] - 1
+    lo = (cdf < (1 - level) / 2).sum(-1, keepdim=True).clamp(max=last)
+    hi = (cdf < (1 + level) / 2).sum(-1, keepdim=True).clamp(max=last)
+    return (atoms.gather(-1, hi) - atoms.gather(-1, lo)).squeeze(-1)
 
 
 class StateMetrics:
-    def __init__(self, objective):
-        self.objective = objective
+    """累计点估计误差（可与旧基线比）+ 联合 NLL（只有模型有）。
+
+    update(targets, probs, outputs)：
+    - probs：``Fabotron.predict`` 的单步边际分布，用来算点估计；None = 持续性基线；
+    - outputs：teacher-forcing 的 logits，用来算联合 NLL = −log p(C) − log p(W|C) − log p(Q|C,W) − 比例 NLL。
+    """
+
+    def __init__(self, coder, objective=None):
+        self.coder, self.objective = coder, objective
         self.count = 0
+        self.sums = {}
         self.parts = {name: 0.0 for name in PARTS}
-        self.metrics = {}
-        self.tv_sums = {"W": 0.0, "Q": 0.0}
-        self.tv_counts = {"W": 0, "Q": 0}
+        self.tv_sum, self.tv_count = 0.0, 0
+        self.pit = {}
+
+    def _distribution(self, name, probs, atoms, true_bin, y, size):
+        """CRPS、覆盖率、区间宽度、PIT 直方图；按 (样本, 组) 平均。"""
+        self._add(f"{name}_crps_lots", crps_discrete(probs, atoms, y).mean(), size)
+        for level in COVERAGE_LEVELS:
+            tag = int(round(level * 100))
+            low, high = (1 - level) / 2, (1 + level) / 2
+            self._add(f"{name}_coverage_{tag}", pit_overlap(probs, true_bin, low, high).mean(), size)
+            self._add(f"{name}_width_{tag}_lots", central_width(probs, atoms, level).float().mean(), size)
+        hist = torch.stack([pit_overlap(probs, true_bin, j / PIT_BINS, (j + 1) / PIT_BINS).mean()
+                            for j in range(PIT_BINS)]) * size
+        self.pit[name] = self.pit.get(name, 0) + hist
+
+    def _add(self, name, value, size):
+        self.sums[name] = self.sums.get(name, 0.0) + value.detach().double() * size
 
     @torch.no_grad()
-    def update(self, prediction, target):
-        size = len(target)
-        objective = self.objective
-        for name, value in objective.components(prediction, target).items():
-            self.parts[name] += value.item() * size
-        p, y = objective.state(prediction), objective.state(target)
-        values = {
-            "wip_mae_lots": (p["W"] - y["W"]).abs().mean(),
-            "queue_mae_lots": (p["Q"] - y["Q"]).abs().mean(),
-            "wip_category_l1_lots_per_group": (p["P_WIP"] - y["P_WIP"]).abs().sum(-1).mean(),
-            "queue_category_l1_lots_per_group": (p["P_Queue"] - y["P_Queue"]).abs().sum(-1).mean(),
-            "equipment_mse": (p["E"] - y["E"]).square().mean(),
-            "negative_wip_fraction": (p["W"] < 0).float().mean(),
-            "negative_queue_fraction": (p["Q"] < 0).float().mean(),
-            "queue_exceeds_wip_fraction": (p["Q"] > p["W"]).float().mean(),
-        }
-        for name, value in values.items():
-            self.metrics[name] = self.metrics.get(name, 0.0) + value.item() * size
-        for total, block in (("W", "P_WIP"), ("Q", "P_Queue")):
-            raw = objective.block(prediction, block)
-            actual = objective.block(target, block)
-            positive = raw.clamp_min(0)
-            mass = positive.sum(-1, keepdim=True)
-            projected = torch.where(mass > 0, positive / mass.clamp_min(1e-12), torch.full_like(raw, 1 / raw.shape[-1]))
-            valid = y[total].squeeze(-1) > 0
-            tv = 0.5 * (projected - actual).abs().sum(-1)
-            self.tv_sums[total] += tv[valid].sum().item()
-            self.tv_counts[total] += valid.sum().item()
-            key = block + "_raw_mass_mae"
-            value = (raw.sum(-1) - actual.sum(-1)).abs().mean().item()
-            self.metrics[key] = self.metrics.get(key, 0.0) + value * size
+    def update(self, targets, probs=None, outputs=None):
+        coder, layout = self.coder, self.coder.layout
+        size = len(targets["w0"])
+        w0, q0, w1, q1 = targets["w0"], targets["q0"], targets["w1"], targets["q1"]
+        capacity = layout.capacity
+        if outputs is not None:
+            for name, value in self.objective.components(outputs, targets).items():
+                self.parts[name] += value.detach().double() * size
+        if probs is None:
+            w_hat, q_hat, w_mean, q_mean = w0, q0, w0, q0
+            c_hat = targets["c0"].float()
+            cells0 = targets["cells0"]
+            comp = torch.where(cells0.sum(-1, keepdim=True) > 0, cells0 / cells0.sum(-1, keepdim=True).clamp(min=1),
+                               layout.cell_mask / layout.cell_mask.sum(-1, keepdim=True))
+        else:
+            w_hat, q_hat = w0 + median_value(coder, 0, probs["w"]), q0 + median_value(coder, 1, probs["q"])
+            w_mean, q_mean = w0 + mean_value(coder, 0, probs["w"]), q0 + mean_value(coder, 1, probs["q"])
+            c_hat = probs["c_hat"]
+            comp = probs["comp"]
+        # 分布指标：原子 = 下一帧可能的取值（与 Fabotron.sample 一致：代表值取整、不小于 0）
+        for which, name, x0, x1 in ((0, "wip", w0, w1), (1, "queue", q0, q1)):
+            true_bin = targets["w_bin" if which == 0 else "q_bin"]
+            if probs is None:   # 持续性 = 全部概率压在 x0 上（CRPS 退化为 MAE）
+                bins = self.coder.bins
+                dist = F.one_hot(coder.bucket(torch.zeros_like(x0), which), bins).float()
+                atoms = x0.unsqueeze(-1).expand(*x0.shape, bins)
+            else:
+                dist = probs["w" if which == 0 else "q"]
+                atoms = (x0.unsqueeze(-1) + coder.bin_values[which].round()).clamp(min=0)
+            self._distribution(name, dist, atoms.float(), true_bin, x1.float(), size)
+        self._add("wip_mae_lots", (w_hat - w1).abs().mean(), size)
+        self._add("queue_mae_lots", (q_hat - q1).abs().mean(), size)
+        self._add("wip_mae_lots_mean_estimate", (w_mean - w1).abs().mean(), size)
+        self._add("queue_mae_lots_mean_estimate", (q_mean - q1).abs().mean(), size)
+        # 与旧 E 指标同口径：三列比例的 MSE
+        self._add("equipment_mse", ((c_hat - targets["c1"]) / capacity).square().mean(), size)
+        self._add("equipment_mae_count", (c_hat - targets["c1"]).abs().mean(), size)
+        # 组内比例 TV（与旧 wip_composition_tv_projected 同一组类别），只算下一帧 W > 0 的组
+        cells1 = targets["cells1"]
+        mass = cells1.sum(-1)
+        valid = mass > 0
+        actual = cells1 / mass.clamp(min=1).unsqueeze(-1)
+        tv = 0.5 * (comp - actual).abs().sum(-1)
+        self.tv_sum += (tv * valid).sum().double()
+        self.tv_count += valid.sum()
         self.count += size
 
     def result(self):
         if not self.count:
             raise ValueError("Empty evaluation set")
-        parts = {name: value / self.count for name, value in self.parts.items()}
-        result = {"samples": self.count, "loss": self.objective.combine(parts), "components": parts,
-                  **{name: value / self.count for name, value in self.metrics.items()}}
-        for total, name in (("W", "wip"), ("Q", "queue")):
-            result[name + "_composition_tv_projected"] = (
-                self.tv_sums[total] / self.tv_counts[total] if self.tv_counts[total] else None)
+        tv_count = int(self.tv_count)
+        result = {"samples": self.count, **{name: float(value / self.count) for name, value in self.sums.items()},
+                  "composition_tv": float(self.tv_sum / tv_count) if tv_count else None,
+                  **{f"{name}_pit_hist": (hist / self.count).tolist() for name, hist in self.pit.items()}}
+        if self.objective is not None:
+            parts = {name: float(value / self.count) for name, value in self.parts.items()}
+            result["components"] = parts
+            result["loss"] = float(self.objective.combine(parts))
         return result

@@ -129,6 +129,26 @@ CQT 只做测量，由插件统计违规；派工本身不感知 CQT，与 AutoS
 
 开发环境为 Python 3.11，仿真本身只需要 NumPy 和 openpyxl；作图需要 Pillow，Fabotron 训练需要 PyTorch。
 
+**解释器：仿真和数据采集默认用 PyPy，训练用 CPython。**
+
+| 用途 | 解释器 | 说明 |
+|---|---|---|
+| 仿真、规则实验、Fabotron 数据采集 | PyPy 3.12（v8.0.1） | 稳态比 CPython 快约 1.7–2 倍；只用标准库，不需要装包。结果与 CPython 逐位相同（指纹核对过） |
+| 导入 SMT2020 工作簿（openpyxl）、作图（Pillow）、Fabotron 训练（PyTorch） | CPython 3.11+ | 这些第三方包在 PyPy 下不可用或没有安装 |
+
+本地 Windows 使用便携版 PyPy（解压即用），把下面命令中的 `python` 换成 `pypy3.exe` 的路径即可。
+
+**Vanda HPC 上必须先下载 PyPy**（一次即可，放在 scratch，不需要管理员权限）：
+
+```bash
+cd /scratch/$USER
+wget https://downloads.python.org/pypy/pypy3.12-v8.0.1-linux64.tar.gz
+tar xzf pypy3.12-v8.0.1-linux64.tar.gz
+/scratch/$USER/pypy3.12-v8.0.1-linux64/bin/pypy3 --version
+```
+
+采集脚本 `fabotron/data_collection/hpc/vanda_branches.pbs` 默认使用这个路径；放在别处时用 `BRANCH_PYTHON=<pypy3 路径>` 覆盖。预热检查点（pickle）只能由同一解释器读取，本地与 Vanda 之间不要混用。
+
 ```bash
 git clone https://github.com/xiaozhe19/myFab.git
 cd myFab
